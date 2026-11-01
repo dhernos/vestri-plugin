@@ -22,6 +22,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.TextComponent;
+import org.mockito.ArgumentCaptor;
 
 class PlayerServersTest {
     @TempDir Path directory;
@@ -37,6 +40,8 @@ class PlayerServersTest {
     private int apiStatus;
     private UUID spawnedId;
     private String spawnBody;
+    private int transientSpawnFailures;
+    private final List<String> spawnRequests = new ArrayList<>();
 
     @BeforeEach
     void setup() throws Exception {
@@ -45,11 +50,16 @@ class PlayerServersTest {
         api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         api.createContext("/api/minecraft/v1/instances", exchange -> {
             calls.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
-                spawnBody = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                String body = exchange.getRequestURI().getPath().equals("/api/minecraft/v1/instances")
-                    ? "{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32) + "\"}" : "{}";
-                byte[] response = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(apiStatus, response.length);
+            spawnBody = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            boolean spawning = exchange.getRequestURI().getPath().equals("/api/minecraft/v1/instances");
+            if (spawning) {
+                spawnRequests.add(spawnBody);
+            }
+            String body = spawning ? "{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32)
+                    + "\",\"name\":\"Survival-1\"}" : "{}";
+            byte[] response = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int responseCode = spawning && transientSpawnFailures-- > 0 ? 502 : apiStatus;
+            exchange.sendResponseHeaders(responseCode, response.length);
             exchange.getResponseBody().write(response);
             exchange.close();
         });
@@ -61,6 +71,7 @@ class PlayerServersTest {
         player = mock(Player.class);
         when(player.getUniqueId()).thenReturn(UUID.randomUUID());
         when(player.isActive()).thenReturn(true);
+        when(player.getUsername()).thenReturn("Owner");
         when(player.hasPermission(anyString())).thenReturn(true);
         when(proxy.getPlayer(player.getUniqueId())).thenReturn(java.util.Optional.of(player));
         target = mock(RegisteredServer.class);
@@ -458,5 +469,169 @@ class PlayerServersTest {
         clock.incrementAndGet();
         service.sweep();
         assertTrue(registry.all().isEmpty());
+    }
+
+    private Player guest(String username) {
+        Player guest = mock(Player.class);
+        when(guest.getUniqueId()).thenReturn(UUID.randomUUID());
+        when(guest.getUsername()).thenReturn(username);
+        when(guest.isActive()).thenReturn(true);
+        when(guest.hasPermission("vestri.servers")).thenReturn(true);
+        when(guest.hasPermission("vestri.servers.join")).thenReturn(true);
+        when(guest.hasPermission("vestri.servers.list")).thenReturn(true);
+        when(proxy.getPlayer(username)).thenReturn(java.util.Optional.of(guest));
+        when(proxy.getPlayer(guest.getUniqueId())).thenReturn(java.util.Optional.of(guest));
+        return guest;
+    }
+
+    private SimpleCommand.Invocation from(Player source, String... arguments) {
+        var invocation = mock(SimpleCommand.Invocation.class);
+        when(invocation.source()).thenReturn(source);
+        when(invocation.arguments()).thenReturn(arguments);
+        return invocation;
+    }
+
+    private static String text(Component component) {
+        StringBuilder output = new StringBuilder(component instanceof TextComponent text ? text.content() : "");
+        component.children().forEach(child -> output.append(text(child)));
+        return output.toString();
+    }
+
+    @Test
+    void npcSpawnAutomaticallyRecoversInitialGatewayErrorWithoutManualRetry() throws Exception {
+        transientSpawnFailures = 1;
+        UUID requestId = UUID.randomUUID();
+        service.spawnForConsole(player, LifecycleRequest.parse(new String[]{"spawn", "Survival", "--type", "temporary",
+                "--send-player", "Owner", "--request-id", requestId.toString()}));
+        assertEquals(2, spawnRequests.size());
+        assertEquals(spawnRequests.get(0), spawnRequests.get(1));
+        assertEquals(1, registry.all().size());
+        assertEquals(OwnedServerRegistry.State.ACTIVE, registry.all().get(0).state);
+        assertEquals("Survival-1", registry.all().get(0).name);
+        verify(target).ping();
+    }
+
+    @Test
+    void invitedGuestCanJoinPermanentServerWhileOwnerIsOfflineButCannotManageIt() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        Player guest = guest("Guest");
+        service.execute(invocation("invite", "Survival-1", "Guest"));
+        assertTrue(entry.invited.containsKey(guest.getUniqueId()));
+        assertEquals(List.of("Survival-1"), service.suggest(from(guest, "join", "")));
+        when(player.isActive()).thenReturn(false);
+        when(proxy.getPlayer(player.getUniqueId())).thenReturn(java.util.Optional.empty());
+        service.execute(from(guest, "join", "Survival-1"));
+        verify(target).ping();
+        assertEquals(player.getUniqueId(), entry.owner);
+        when(guest.hasPermission("vestri.servers.delete")).thenReturn(true);
+        when(guest.hasPermission("vestri.servers.invite")).thenReturn(true);
+        service.execute(from(guest, "delete", "Survival-1", "--confirm"));
+        service.execute(from(guest, "invite", "Survival-1", "Other"));
+        assertTrue(calls.isEmpty());
+        assertEquals(1, entry.invited.size());
+        var restored = new OwnedServerRegistry(directory.resolve("owned.json"));
+        assertEquals(entry.serverId, restored.requireJoin(guest.getUniqueId(), "Survival-1", false).serverId);
+    }
+
+    @Test
+    void uninvitedAndRevokedGuestsCannotJoinOrSeeOtherServers() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        Player guest = guest("Guest");
+        service.execute(from(guest, "join", "Survival-1"));
+        assertEquals(List.of(), service.suggest(from(guest, "join", "")));
+        verify(target, never()).ping();
+        service.execute(invocation("invite", "Survival-1", "Guest"));
+        service.execute(invocation("revoke", "Survival-1", "Guest"));
+        assertFalse(entry.invited.containsKey(guest.getUniqueId()));
+        service.execute(from(guest, "join", "Survival-1"));
+        verify(target, never()).ping();
+        assertEquals(List.of(), service.suggest(from(guest, "join", "")));
+    }
+
+    @Test
+    void adminJoinPermissionBypassesAccessWithoutGrantingOwnershipOrRequiringNormalJoin() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        Player admin = guest("Admin");
+        when(admin.hasPermission("vestri.servers.join")).thenReturn(false);
+        when(admin.hasPermission("vestri.servers.join.admin")).thenReturn(true);
+        service.execute(from(admin, "join", "Survival-1"));
+        verify(target).ping();
+        assertEquals(List.of("Survival-1"), service.suggest(from(admin, "join", "")));
+        when(admin.hasPermission("vestri.servers.delete")).thenReturn(true);
+        service.execute(from(admin, "delete", "Survival-1", "--confirm"));
+        assertEquals(player.getUniqueId(), entry.owner);
+        assertTrue(calls.isEmpty());
+    }
+
+    @Test
+    void permissionsRestrictEveryActionAndRetryCannotBypassJoinPermission() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        for (String action : List.of("list", "retry", "delete", "invite", "revoke")) {
+            when(player.hasPermission("vestri.servers." + action)).thenReturn(false);
+            assertFalse(service.hasPermission(invocation(action)));
+        }
+        when(player.hasPermission("vestri.servers.spawn.permanent")).thenReturn(false);
+        when(player.hasPermission("vestri.servers.spawn.temporary")).thenReturn(true);
+        assertFalse(service.hasPermission(invocation("spawn", "permanent", "Survival")));
+        assertTrue(service.hasPermission(invocation("spawn", "temporary", "Survival")));
+        assertEquals(List.of("temporary"), service.suggest(invocation("spawn", "")));
+        when(player.hasPermission("vestri.servers.join")).thenReturn(false);
+        when(player.hasPermission("vestri.servers.join.admin")).thenReturn(false);
+        when(player.hasPermission("vestri.servers.retry")).thenReturn(true);
+        service.execute(invocation("join", "Survival-1"));
+        service.execute(invocation("retry", "Survival-1"));
+        verify(target, never()).ping();
+        when(player.hasPermission("vestri.servers.pause")).thenReturn(false);
+        assertFalse(service.pauseCommand().hasPermission(invocation(entry.serverId)));
+    }
+
+    @Test
+    void invitationsArePermanentOnlyAndRevocationWorksForOfflineGuests() throws Exception {
+        var temporary = entry(OwnedServerRegistry.Type.TEMPORARY);
+        Player guest = guest("Guest");
+        service.execute(invocation("invite", "Survival-1", "Guest"));
+        assertTrue(temporary.invited.isEmpty());
+        temporary.type = OwnedServerRegistry.Type.PERMANENT;
+        service.execute(invocation("invite", "Survival-1", "Guest"));
+        when(proxy.getPlayer("Guest")).thenReturn(java.util.Optional.empty());
+        service.execute(invocation("revoke", "Survival-1", "Guest"));
+        assertTrue(temporary.invited.isEmpty());
+        assertThrows(java.io.IOException.class, () -> registry.requireJoin(guest.getUniqueId(), "Survival-1", false));
+    }
+
+    @Test
+    void playerMessagesAndCompletionUseNamesNeverInternalIds() throws Exception {
+        service.execute(invocation("spawn", "temporary", "Survival"));
+        var entry = registry.all().get(0);
+        service.execute(invocation("list"));
+        service.pauseCommand().execute(invocation("Survival-1"));
+        service.execute(invocation("join", "Survival-1"));
+        var messages = ArgumentCaptor.forClass(Component.class);
+        verify(player, atLeastOnce()).sendMessage(messages.capture());
+        String all = String.join("\n", messages.getAllValues().stream().map(PlayerServersTest::text).toList());
+        assertTrue(all.contains("Survival-1"));
+        assertFalse(all.contains(entry.serverId));
+        assertFalse(all.contains(entry.requestId.toString()));
+        assertFalse(all.contains(entry.slug));
+        assertTrue(messages.getAllValues().stream().anyMatch(component -> component.color() != null));
+        assertEquals(List.of("Survival-1"), service.suggest(invocation("join", "")));
+    }
+
+    @Test
+    void revokingInvitationCancelsAlreadyQueuedGuestJoin() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        Player guest = guest("Guest");
+        List<Runnable> waiting = new ArrayList<>();
+        var guarded = new PlayerServers(proxy, configuration, registry,
+                new SpawnPlayerTransfer(proxy, (task, delay) -> waiting.add(task)), Runnable::run, mock(Logger.class), clock::get);
+        guarded.execute(invocation("invite", "Survival-1", "Guest"));
+        guarded.execute(from(guest, "join", "Survival-1"));
+        assertEquals(1, waiting.size());
+        guarded.execute(invocation("revoke", "Survival-1", "Guest"));
+        waiting.remove(0).run();
+        verify(target, times(1)).ping();
+        verify(guest, never()).createConnectionRequest(any());
+        assertTrue(waiting.isEmpty());
+        assertTrue(entry.invited.isEmpty());
     }
 }

@@ -92,6 +92,18 @@ class SpawnPlayerTransferTest {
     }
 
     @Test
+    void cancelledAccessStopsAWaitingTransferBeforeConnection() {
+        var allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(target.ping()).thenReturn(CompletableFuture.completedFuture(readyPing()));
+        transfer.start(player, instance, messages::add, allowed::get);
+        allowed.set(false);
+        scheduled.remove(0).run();
+        verify(player, never()).createConnectionRequest(target);
+        assertTrue(scheduled.isEmpty());
+        assertTrue(messages.stream().anyMatch(message -> message.contains("access was revoked")));
+    }
+
+    @Test
     void waitsForRegistrationAndPingBeforeConnectingToExactInstance() {
         var ping = new CompletableFuture<ServerPing>();
         when(target.ping()).thenReturn(ping);

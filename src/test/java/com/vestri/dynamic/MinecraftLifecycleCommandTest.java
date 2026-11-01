@@ -181,7 +181,7 @@ class MinecraftLifecycleCommandTest {
             assertEquals(List.of("POST"), calls);
             verify(target).ping();
             assertEquals(1, polls.size());
-            verify(console).sendMessage(Component.text("Instance starting: " + instance));
+            verify(console).sendMessage(Component.text("Server starting: Bed Wars"));
         } finally {
             server.stop(0);
         }

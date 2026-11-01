@@ -34,6 +34,8 @@ class MinecraftInstanceClientTest {
     private String spawnBody;
     private String spawnSlug;
     private int responseStatus;
+    private int transientSpawnFailures;
+    private final List<String> spawnRequests = new ArrayList<>();
 
     @Test
     void generatesSafeStarterConfigurationWithoutOverwritingExistingFiles() throws Exception {
@@ -94,13 +96,16 @@ class MinecraftInstanceClientTest {
             String body = listed;
             if ("POST".equals(exchange.getRequestMethod())) {
                 spawnBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                spawnRequests.add(spawnBody);
                 body = "{\"serverId\":\"" + instance + "\",\"slug\":\"" + spawnSlug + "\",\"state\":\"starting\"}";
             }
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             if ("DELETE".equals(exchange.getRequestMethod())) {
                 exchange.sendResponseHeaders(204, -1);
             } else {
-                exchange.sendResponseHeaders(responseStatus, bytes.length);
+                int statusCode = exchange.getRequestURI().getPath().equals("/api/minecraft/v1/instances")
+                    && "POST".equals(exchange.getRequestMethod()) && transientSpawnFailures-- > 0 ? 502 : responseStatus;
+                exchange.sendResponseHeaders(statusCode, bytes.length);
                 exchange.getResponseBody().write(bytes);
             }
             exchange.close();
@@ -121,6 +126,27 @@ class MinecraftInstanceClientTest {
         assertEquals(instance.toString(), client.spawn("BED WARS", request));
         assertEquals(request.toString(), JsonParser.parseString(spawnBody).getAsJsonObject().get("requestId").getAsString());
         assertEquals(List.of("POST /api/minecraft/v1/instances"), calls);
+    }
+
+    @Test
+    void automaticallyRecoversGatewayFailureUsingExactlyTheSameRequest() throws Exception {
+        transientSpawnFailures = 1;
+        UUID requestId = UUID.randomUUID();
+        assertEquals(instance.toString(), client.spawnWithTarget("Bed Wars", requestId).serverId());
+        assertEquals(2, spawnRequests.size());
+        assertEquals(spawnRequests.get(0), spawnRequests.get(1));
+        assertEquals(requestId.toString(), JsonParser.parseString(spawnRequests.get(1)).getAsJsonObject().get("requestId").getAsString());
+    }
+
+    @Test
+    void gatewayRecoveryIsBoundedAndDoesNotRetryAuthorizationFailures() {
+        responseStatus = 502;
+        assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
+        assertEquals(3, spawnRequests.size());
+        assertEquals(1, spawnRequests.stream().distinct().count());
+        responseStatus = 401;
+        assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
+        assertEquals(4, spawnRequests.size());
     }
 
     @Test

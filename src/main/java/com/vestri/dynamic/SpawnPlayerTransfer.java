@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 
@@ -36,13 +37,18 @@ final class SpawnPlayerTransfer {
     }
 
     void start(Player player, MinecraftInstanceClient.SpawnedInstance instance, Consumer<String> output) {
-        new WaitingTransfer(player, instance, output).poll();
+        start(player, instance, output, () -> true);
+    }
+
+    void start(Player player, MinecraftInstanceClient.SpawnedInstance instance, Consumer<String> output, BooleanSupplier access) {
+        new WaitingTransfer(player, instance, output, access).poll();
     }
 
     private final class WaitingTransfer {
         private final Player player;
         private final MinecraftInstanceClient.SpawnedInstance instance;
         private final Consumer<String> output;
+        private final BooleanSupplier access;
         private final long deadline = clock.getAsLong() + timeout.toNanos();
         private final AtomicBoolean finished = new AtomicBoolean();
         private boolean announced;
@@ -50,10 +56,11 @@ final class SpawnPlayerTransfer {
         private long readySince;
         private int countdown;
 
-        WaitingTransfer(Player player, MinecraftInstanceClient.SpawnedInstance instance, Consumer<String> output) {
+        WaitingTransfer(Player player, MinecraftInstanceClient.SpawnedInstance instance, Consumer<String> output, BooleanSupplier access) {
             this.player = player;
             this.instance = instance;
             this.output = output;
+            this.access = access;
         }
 
         private boolean active() {
@@ -66,6 +73,11 @@ final class SpawnPlayerTransfer {
             }
             if (!active()) {
                 finish("Transfer cancelled: the player disconnected. The instance was not deleted.", null);
+                return false;
+            }
+            if (!access.getAsBoolean()) {
+                finish("Transfer cancelled: server access was revoked.",
+                        Component.text("You no longer have permission to join this server.", NamedTextColor.RED));
                 return false;
             }
             if (remaining() <= 0) {
@@ -87,7 +99,8 @@ final class SpawnPlayerTransfer {
             if (!announced) {
                 announced = true;
                 report("Waiting for Minecraft to become ready for " + player.getUsername() + ".",
-                    Component.text("Your server is starting. We'll connect you when it's ready.", NamedTextColor.AQUA));
+                    Component.text((instance.name() == null ? "Your server" : instance.name())
+                            + " is starting. We'll connect you when it's ready.", NamedTextColor.AQUA));
             }
             RegisteredServer target = resolve();
             if (target == null) {

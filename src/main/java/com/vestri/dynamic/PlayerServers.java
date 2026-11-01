@@ -15,12 +15,15 @@ import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.event.ClickEvent;
+import net.kyori.adventure.text.event.HoverEvent;
 import org.slf4j.Logger;
 
 final class PlayerServers implements SimpleCommand {
     private static final long JOIN_WINDOW = Duration.ofMinutes(6).toMillis();
     private static final String USAGE = "/vestriservers list | spawn <permanent|temporary> <template> | "
-            + "retry <request UUID> | join <server UUID> | delete <server UUID> --confirm";
+            + "retry [server] | join <server> | delete <server> --confirm | invite <server> <player> | revoke <server> <player>";
     private final ProxyServer proxy;
     private final Path configuration;
     private final OwnedServerRegistry registry;
@@ -48,22 +51,50 @@ final class PlayerServers implements SimpleCommand {
 
     @Override
     public boolean hasPermission(Invocation invocation) {
-        return invocation.source() instanceof Player && invocation.source().hasPermission("vestri.servers");
+        return invocation.source() instanceof Player player && player.hasPermission("vestri.servers")
+                && allowed(player, invocation.arguments());
+    }
+
+    private static boolean allowed(Player player, String[] arguments) {
+        String action = arguments.length == 0 ? "list" : arguments[0].toLowerCase(Locale.ROOT);
+        if (action.equals("join")) {
+            return canUseJoin(player);
+        }
+        if (action.equals("spawn")) {
+            return arguments.length < 2
+                    ? player.hasPermission("vestri.servers.spawn.permanent") || player.hasPermission("vestri.servers.spawn.temporary")
+                    : List.of("permanent", "temporary").contains(arguments[1].toLowerCase(Locale.ROOT))
+                        && player.hasPermission("vestri.servers.spawn." + arguments[1].toLowerCase(Locale.ROOT));
+        }
+        return player.hasPermission("vestri.servers." + action);
+    }
+
+    private static boolean canUseJoin(Player player) {
+        return player.hasPermission("vestri.servers.join") || player.hasPermission("vestri.servers.join.admin");
+    }
+
+    private boolean adminJoin(Player player) {
+        return player.hasPermission("vestri.servers.join.admin");
     }
 
     @Override
-    public List<String> suggest(Invocation invocation) {
-        if (!hasPermission(invocation)) {
+    public synchronized List<String> suggest(Invocation invocation) {
+        if (!(invocation.source() instanceof Player player) || !player.hasPermission("vestri.servers")) {
             return List.of();
         }
         String[] arguments = invocation.arguments();
         String current = arguments.length == 0 ? "" : arguments[arguments.length - 1];
         if (arguments.length <= 1) {
-            return matching(List.of("list", "spawn", "retry", "join", "delete"), current);
+            return matching(List.of("list", "spawn", "retry", "join", "delete", "invite", "revoke").stream()
+                    .filter(action -> allowed(player, new String[]{action})).toList(), current);
+        }
+        if (!allowed(player, arguments.length == 2 && arguments[0].equals("spawn") ? new String[]{"spawn"} : arguments)) {
+            return List.of();
         }
         if (arguments[0].equals("spawn")) {
             if (arguments.length == 2) {
-                return matching(List.of("permanent", "temporary"), current);
+                return matching(List.of("permanent", "temporary").stream()
+                    .filter(type -> player.hasPermission("vestri.servers.spawn." + type)).toList(), current);
             }
             try {
                 String prefix = String.join(" ", Arrays.copyOfRange(arguments, 2, arguments.length));
@@ -76,20 +107,35 @@ final class PlayerServers implements SimpleCommand {
                 return List.of();
             }
         }
-        if (arguments.length == 2 && List.of("retry", "join", "delete").contains(arguments[0])) {
-            return matching(registry.owned(((Player) invocation.source()).getUniqueId()).stream()
-                    .map(entry -> entry.serverId == null ? entry.requestId.toString() : entry.serverId).toList(), current);
+        if (arguments.length == 2 && List.of("retry", "join", "delete", "invite", "revoke").contains(arguments[0])) {
+            var choices = arguments[0].equals("join") ? registry.accessible(player.getUniqueId(), adminJoin(player))
+                    : registry.owned(player.getUniqueId());
+            return matching(choices.stream().map(this::serverName).toList(), current);
+        }
+        if (arguments.length == 3 && arguments[0].equals("invite")) {
+            return matching(proxy.getAllPlayers().stream().filter(other -> !other.getUniqueId().equals(player.getUniqueId()))
+                    .map(Player::getUsername).toList(), current);
+        }
+        if (arguments.length == 3 && arguments[0].equals("revoke")) {
+            try {
+                return matching(List.copyOf(registry.require(player.getUniqueId(), arguments[1]).invited.values()), current);
+            } catch (IOException failure) {
+                return List.of();
+            }
         }
         return arguments[0].equals("delete") && arguments.length == 3 ? matching(List.of("--confirm"), current) : List.of();
     }
 
     private static List<String> matching(List<String> choices, String prefix) {
-        return choices.stream().filter(choice -> choice.startsWith(prefix)).toList();
+        return choices.stream().filter(choice -> choice.toLowerCase(Locale.ROOT).startsWith(prefix.toLowerCase(Locale.ROOT))).sorted().toList();
     }
 
     @Override
     public void execute(Invocation invocation) {
         if (!hasPermission(invocation)) {
+            if (invocation.source() instanceof Player player) {
+                error(player, "You do not have permission to use that command.");
+            }
             return;
         }
         Player player = (Player) invocation.source();
@@ -101,7 +147,8 @@ final class PlayerServers implements SimpleCommand {
         return new SimpleCommand() {
             @Override
             public boolean hasPermission(Invocation invocation) {
-                return PlayerServers.this.hasPermission(invocation) && invocation.source().hasPermission("vestri.servers.pause");
+                return invocation.source() instanceof Player && invocation.source().hasPermission("vestri.servers")
+                        && invocation.source().hasPermission("vestri.servers.pause");
             }
 
             @Override
@@ -112,7 +159,7 @@ final class PlayerServers implements SimpleCommand {
                 String prefix = invocation.arguments().length == 0 ? "" : invocation.arguments()[0];
                 return matching(registry.owned(((Player) invocation.source()).getUniqueId()).stream()
                         .filter(entry -> entry.type == OwnedServerRegistry.Type.TEMPORARY && entry.serverId != null)
-                        .map(entry -> entry.serverId).toList(), prefix);
+                        .map(PlayerServers.this::serverName).toList(), prefix);
             }
 
             @Override
@@ -124,7 +171,7 @@ final class PlayerServers implements SimpleCommand {
                 String[] arguments = invocation.arguments().clone();
                 schedule.accept(() -> run(player, () -> {
                     if (arguments.length != 1) {
-                        message(player, "/vestripause <server UUID> (toggles pause)");
+                        message(player, "/vestripause <server> (toggles pause)");
                         return;
                     }
                     pause(player, arguments[0]);
@@ -137,16 +184,37 @@ final class PlayerServers implements SimpleCommand {
         if (!player.isActive()) {
             return;
         }
+        if (!player.hasPermission("vestri.servers") || !allowed(player, arguments)) {
+            throw new IOException("You do not have permission to use that command.");
+        }
+        boolean renamed = false;
+        for (var entry : registry.all()) {
+            String previous = entry.name;
+            serverName(entry);
+            renamed = renamed || !java.util.Objects.equals(previous, entry.name);
+        }
+        if (renamed) {
+            registry.save();
+        }
         if (arguments.length == 0 || (arguments.length == 1 && arguments[0].equals("list"))) {
-            List<OwnedServerRegistry.Entry> owned = registry.owned(player.getUniqueId());
-            message(player, owned.isEmpty() ? "You own no servers." : "Your servers:");
-            for (var entry : owned) {
-                String id = entry.serverId == null ? entry.requestId.toString() : entry.serverId;
-                message(player, entry.template + " | " + entry.type.name().toLowerCase(Locale.ROOT)
-                        + " | " + entry.state.name().toLowerCase(Locale.ROOT) + (entry.paused ? " | paused" : "")
+            List<OwnedServerRegistry.Entry> accessible = registry.accessible(player.getUniqueId(), adminJoin(player));
+            message(player, accessible.isEmpty() ? "No servers to show yet." : "Your available servers:");
+            for (var entry : accessible) {
+                String name = serverName(entry);
+                String detail = entry.type.name().toLowerCase(Locale.ROOT) + " | " + stateLabel(entry)
+                        + (entry.owner.equals(player.getUniqueId()) ? " | yours" : entry.invited.containsKey(player.getUniqueId()) ? " | invited" : " | admin")
+                        + (entry.paused ? " | paused" : "")
                         + (entry.state == OwnedServerRegistry.State.PENDING_DELETION
-                            ? " | deletes in " + Math.max(0, (entry.deleteAfter - clock.getAsLong() + 999) / 1000) + "s" : "")
-                        + " | " + id);
+                            ? " | kept for " + Math.max(0, (entry.deleteAfter - clock.getAsLong() + 999) / 1000) + "s" : "");
+                Component row = Component.text(name, NamedTextColor.AQUA).append(Component.text("  " + detail, NamedTextColor.GRAY));
+                if (canUseJoin(player) && entry.serverId != null) {
+                    row = row.clickEvent(ClickEvent.runCommand("/vestriservers join " + name))
+                            .hoverEvent(HoverEvent.showText(Component.text("Join " + name, NamedTextColor.GREEN)));
+                }
+                player.sendMessage(row);
+                if (entry.owner.equals(player.getUniqueId()) && !entry.invited.isEmpty()) {
+                    message(player, "Invited to " + name + ": " + String.join(", ", entry.invited.values()));
+                }
             }
         } else if (arguments.length >= 3 && arguments[0].equals("spawn")) {
             PlayerServerPolicy policy = PlayerServerPolicy.load(configuration);
@@ -165,21 +233,51 @@ final class PlayerServers implements SimpleCommand {
                 throw new IOException("Unknown template. Available: " + String.join(", ", client.templates()));
             }
             var entry = reserveForSpawn(player, template, type, policy, client, UUID.randomUUID());
-            message(player, "Spawning server. Request ID: " + entry.requestId + ". Use /vestriservers retry with this ID after a failure.");
+            message(player, "Preparing " + serverName(entry) + ". We'll connect you when it's ready.");
             spawn(player, entry, client);
-        } else if (arguments.length == 2 && arguments[0].equals("retry")) {
-            var entry = registry.require(player.getUniqueId(), arguments[1]);
+        } else if ((arguments.length == 1 || arguments.length == 2) && arguments[0].equals("retry")) {
+            var pending = registry.owned(player.getUniqueId()).stream()
+                    .filter(entry -> entry.state == OwnedServerRegistry.State.PROVISIONING).toList();
+            if (arguments.length == 1 && pending.size() != 1) {
+                throw new IOException("Choose a server from your list: /vestriservers retry <server>.");
+            }
+            var entry = arguments.length == 1 ? pending.get(0) : registry.require(player.getUniqueId(), arguments[1]);
             if (entry.state == OwnedServerRegistry.State.PROVISIONING) {
                 spawn(player, entry, MinecraftInstanceClient.load(configuration));
             } else {
-                join(player, entry);
+                if (!canUseJoin(player)) {
+                    throw new IOException("You need join permission to reconnect to an existing server.");
+                }
+                join(player, entry, true);
             }
         } else if (arguments.length == 2 && arguments[0].equals("join")) {
-            join(player, registry.require(player.getUniqueId(), arguments[1]));
+            join(player, registry.requireJoin(player.getUniqueId(), arguments[1], adminJoin(player)), true);
+        } else if (arguments.length == 3 && arguments[0].equals("invite")) {
+            var entry = registry.require(player.getUniqueId(), arguments[1]);
+            if (entry.type != OwnedServerRegistry.Type.PERMANENT || entry.serverId == null || entry.state == OwnedServerRegistry.State.DELETING) {
+                throw new IOException("Invitations are available for created permanent servers only.");
+            }
+            Player guest = proxy.getPlayer(arguments[2]).filter(Player::isActive)
+                    .orElseThrow(() -> new IOException("That player must be online to receive their first invitation."));
+            if (guest.getUniqueId().equals(player.getUniqueId())) {
+                throw new IOException("You already own this server.");
+            }
+            registry.invite(entry, guest.getUniqueId(), guest.getUsername());
+            String name = serverName(entry);
+            message(player, guest.getUsername() + " can now join " + name + ", even while you're offline.");
+            guest.sendMessage(notice(Component.text(player.getUsername() + " invited you to ", NamedTextColor.WHITE)
+                    .append(Component.text(name, NamedTextColor.AQUA))
+                    .append(Component.text(". [Join]", NamedTextColor.GREEN)
+                        .clickEvent(ClickEvent.runCommand("/vestriservers join " + name))
+                        .hoverEvent(HoverEvent.showText(Component.text("Join " + name))))));
+        } else if (arguments.length == 3 && arguments[0].equals("revoke")) {
+            var entry = registry.require(player.getUniqueId(), arguments[1]);
+            registry.revoke(entry, arguments[2]);
+            message(player, arguments[2] + " can no longer join " + serverName(entry) + ".");
         } else if (arguments.length == 3 && arguments[0].equals("delete") && arguments[2].equals("--confirm")) {
             var entry = registry.require(player.getUniqueId(), arguments[1]);
             if (entry.serverId == null) {
-                throw new IOException("Spawn outcome is unknown. Retry the saved request ID before deleting.");
+                throw new IOException("Your server is still being prepared. Use /vestriservers retry " + serverName(entry) + " first.");
             }
             if (occupied(entry)) {
                 throw new IOException("Server is occupied. All players must leave before it can be deleted.");
@@ -187,7 +285,7 @@ final class PlayerServers implements SimpleCommand {
             entry.state = OwnedServerRegistry.State.DELETING;
             registry.save();
             delete(entry, MinecraftInstanceClient.load(configuration));
-            message(player, "Server deleted.");
+            message(player, serverName(entry) + " has been deleted.");
         } else {
             message(player, USAGE);
         }
@@ -198,10 +296,13 @@ final class PlayerServers implements SimpleCommand {
         var instance = client.spawnWithTarget(entry.template, entry.requestId);
         entry.serverId = instance.serverId();
         entry.slug = instance.slug();
+        if (instance.name() != null) {
+            entry.name = instance.name();
+        }
         entry.state = OwnedServerRegistry.State.ACTIVE;
         entry.joinUntil = clock.getAsLong() + JOIN_WINDOW;
         registry.save();
-        message(player, "Server created: " + entry.serverId);
+        message(player, serverName(entry) + " is starting. Your connection will begin shortly.");
         transfer.start(player, instance, logger::info);
     }
 
@@ -218,6 +319,7 @@ final class PlayerServers implements SimpleCommand {
         }
         var entry = reserveForSpawn(player, template, type, policy, client, request.requestId());
         if (entry.state == OwnedServerRegistry.State.PROVISIONING) {
+            message(player, "Preparing " + serverName(entry) + ". We'll connect you when it's ready.");
             spawn(player, entry, client);
         } else {
             join(player, entry);
@@ -245,8 +347,8 @@ final class PlayerServers implements SimpleCommand {
         }
         entry.idleSince = 0;
         registry.save();
-        message(player, entry.paused ? "Server paused. It will stop when empty and start on the next join."
-            : "Server unpaused. Empty shutdown and delayed deletion are enabled.");
+        message(player, entry.paused ? serverName(entry) + " is protected. It will sleep when empty and wake when you return."
+            : serverName(entry) + " is no longer protected. The empty-server countdown is enabled.");
     }
 
     private OwnedServerRegistry.Entry reserveForSpawn(Player player, String template, OwnedServerRegistry.Type type,
@@ -268,12 +370,16 @@ final class PlayerServers implements SimpleCommand {
             entry.state = OwnedServerRegistry.State.DELETING;
             registry.save();
             delete(entry, client);
-            message(player, "Deleted pending temporary server " + entry.serverId + " to create your new server.");
+            message(player, "Removed " + serverName(entry) + " to make room for your new server.");
         }
         return registry.reserve(player.getUniqueId(), template, type, policy.limit(type), requestId);
     }
 
     private void join(Player player, OwnedServerRegistry.Entry entry) throws IOException, InterruptedException {
+        join(player, entry, false);
+    }
+
+    private void join(Player player, OwnedServerRegistry.Entry entry, boolean enforceAccess) throws IOException, InterruptedException {
         if (entry.serverId == null || entry.state == OwnedServerRegistry.State.DELETING) {
             throw new IOException("Server is not available to join.");
         }
@@ -291,7 +397,9 @@ final class PlayerServers implements SimpleCommand {
         }
         entry.joinUntil = clock.getAsLong() + JOIN_WINDOW;
         registry.save();
-        transfer.start(player, entry.target(), logger::info);
+        message(player, "Connecting you to " + serverName(entry) + ".");
+        transfer.start(player, entry.target(), logger::info, () -> !enforceAccess || player.hasPermission("vestri.servers")
+            && canUseJoin(player) && registry.accessible(player.getUniqueId(), adminJoin(player)).contains(entry));
     }
 
     synchronized void beforeConnect(ServerPreConnectEvent event) {
@@ -406,8 +514,8 @@ final class PlayerServers implements SimpleCommand {
                 registry.save();
                 if (!entry.paused) {
                     proxy.getPlayer(entry.owner).filter(Player::isActive).ifPresent(owner -> message(owner,
-                            "Temporary server " + entry.serverId + " has shut down. Rejoin within " + policy.deletionGraceSeconds()
-                            + " seconds to keep it: /vestriservers join " + entry.serverId));
+                            serverName(entry) + " is resting. You have " + policy.deletionGraceSeconds()
+                            + " seconds to return: /vestriservers join " + serverName(entry)));
                 }
             }
         } catch (InterruptedException failure) {
@@ -445,13 +553,55 @@ final class PlayerServers implements SimpleCommand {
             Thread.currentThread().interrupt();
             message(player, "Request interrupted. Check /vestriservers list before retrying.");
         } catch (IOException failure) {
-            message(player, failure.getMessage());
+            logger.warn("Player server command failed: {}", failure.getMessage());
+            String text = failure.getMessage();
+            error(player, text != null && text.startsWith("Vestri API returned")
+                    ? "Your server couldn't finish starting. Try /vestriservers retry, or contact a staff member."
+                    : text == null ? "We couldn't complete that request. Please try again." : text);
         } catch (RuntimeException failure) {
             message(player, "Invalid server configuration or API response. Contact an administrator.");
         }
     }
 
     private static void message(Player player, String text) {
-        player.sendMessage(Component.text(text));
+        player.sendMessage(notice(Component.text(safeMessage(text), NamedTextColor.WHITE)));
+    }
+
+    private static void error(Player player, String text) {
+        player.sendMessage(notice(Component.text(safeMessage(text), NamedTextColor.RED)));
+    }
+
+    private static Component notice(Component content) {
+        return Component.text("Vestri", NamedTextColor.DARK_AQUA)
+                .append(Component.text(" > ", NamedTextColor.DARK_GRAY)).append(content);
+    }
+
+    private static String safeMessage(String text) {
+        return text.replaceAll("(?i)[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", "your server");
+    }
+
+    private String serverName(OwnedServerRegistry.Entry entry) {
+        if (entry.slug != null) {
+            var registered = proxy.getAllServers().stream().filter(server -> matches(entry, server)).findFirst();
+            if (registered.isPresent()) {
+                String name = registered.get().getServerInfo().getName();
+                if (name.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[1-9][0-9]*")) {
+                    entry.name = name;
+                }
+            }
+        }
+        return entry.displayName();
+    }
+
+    private static String stateLabel(OwnedServerRegistry.Entry entry) {
+        return switch (entry.state) {
+            case PROVISIONING -> "preparing";
+            case ACTIVE -> "ready";
+            case STARTING -> "starting";
+            case STOPPING -> "shutting down";
+            case STOPPED -> "sleeping";
+            case PENDING_DELETION -> "waiting for your return";
+            case DELETING -> "removing";
+        };
     }
 }

@@ -11,6 +11,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Consumer;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.slf4j.LoggerFactory;
 
 final class MinecraftLifecycleCommand implements SimpleCommand {
     private static final String USAGE = "vestridynamic templates | list <template name> | "
@@ -78,8 +80,9 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
             return;
         }
         if (command.action().equals("spawn")) {
-            invocation.source().sendMessage(Component.text("Spawning " + command.template()
-                    + "; requestId=" + command.requestId() + ". Retry with this ID if the request fails."));
+            invocation.source().sendMessage(Component.text("Preparing " + command.template() + "; recovering transient failures automatically.", NamedTextColor.AQUA));
+            LoggerFactory.getLogger(MinecraftLifecycleCommand.class).info("Vestri spawn diagnostic: template={}, requestId={}",
+                command.template(), command.requestId());
         }
         schedule.accept(() -> {
             try {
@@ -99,10 +102,11 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                             yield "Owned " + command.serverType() + " server request processed for " + selected.getUsername() + ".";
                         }
                         if (selected == null) {
-                            yield "Instance starting: " + client.spawn(command.template(), command.requestId());
+                            var instance = client.spawnWithTarget(command.template(), command.requestId());
+                            yield "Server starting: " + (instance.name() == null ? command.template() : instance.name());
                         }
                         var instance = client.spawnWithTarget(command.template(), command.requestId());
-                        invocation.source().sendMessage(Component.text("Instance starting: " + instance.serverId()));
+                        invocation.source().sendMessage(Component.text("Server starting: " + (instance.name() == null ? command.template() : instance.name())));
                         transfer.start(selected, instance, message -> invocation.source().sendMessage(Component.text(message)));
                         yield null;
                     }
@@ -117,6 +121,10 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                 invocation.source().sendMessage(Component.text("Vestri request interrupted; check instance state before retrying."));
             } catch (IOException failure) {
                 invocation.source().sendMessage(Component.text("Vestri command failed: " + failure.getMessage()));
+                if (selected != null && selected.isActive()) {
+                    selected.sendMessage(Component.text("Vestri > ", NamedTextColor.DARK_AQUA)
+                            .append(Component.text("We couldn't finish preparing your server. Use /vestriservers list and retry it by name, or contact a staff member.", NamedTextColor.RED)));
+                }
             } catch (RuntimeException failure) {
                 invocation.source().sendMessage(Component.text("Vestri command failed: invalid configuration or API response."));
             }

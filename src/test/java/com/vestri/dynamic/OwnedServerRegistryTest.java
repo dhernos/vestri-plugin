@@ -61,4 +61,22 @@ class OwnedServerRegistryTest {
         registry.save();
         assertThrows(IOException.class, () -> new OwnedServerRegistry(file));
     }
+
+    @Test
+    void namedInvitationsSurviveRestartAndNeverGrantOwnership() throws Exception {
+        Path file = directory.resolve("owned.json");
+        var registry = new OwnedServerRegistry(file);
+        UUID owner = UUID.randomUUID();
+        UUID guest = UUID.randomUUID();
+        var entry = registry.reserve(owner, "Bed Wars", OwnedServerRegistry.Type.PERMANENT, 1);
+        entry.name = "BedWars-1";
+        registry.invite(entry, guest, "Guest");
+        var restored = new OwnedServerRegistry(file);
+        assertEquals(owner, restored.requireJoin(guest, "bedwars-1", false).owner);
+        assertThrows(IOException.class, () -> restored.require(guest, "BedWars-1"));
+        assertThrows(IOException.class, () -> restored.requireJoin(UUID.randomUUID(), "BedWars-1", false));
+        assertEquals(owner, restored.requireJoin(UUID.randomUUID(), "BedWars-1", true).owner);
+        restored.revoke(restored.require(owner, "BedWars-1"), "guest");
+        assertThrows(IOException.class, () -> new OwnedServerRegistry(file).requireJoin(guest, "BedWars-1", false));
+    }
 }

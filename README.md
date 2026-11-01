@@ -43,8 +43,9 @@ the proxy's existing `vestri-dynamic-config.json`:
 Newly generated configuration includes this section with `enabled: false`.
 Existing configuration is not overwritten. Set `enabled: true` explicitly to
 allow owned spawning. Settings are reread without a restart. Grant players the
-Velocity permission `vestri.servers`, and additionally `vestri.servers.pause`
-for the separate pause command. Console/NPC owned spawns are trusted console
+Velocity base permission `vestri.servers` and the action-specific permissions
+listed below. The base permission alone does not grant every command.
+Console/NPC owned spawns are trusted console
 actions and do not require the selected player to hold these permissions, but
 still obey configuration and per-user limits.
 
@@ -52,10 +53,13 @@ still obey configuration and per-user limits.
 /vestriservers spawn permanent Survival
 /vestriservers spawn temporary Bed Wars
 /vestriservers list
-/vestriservers join <server UUID>
-/vestriservers delete <server UUID> --confirm
-/vestriservers retry <request UUID>
-/vestripause <server UUID>
+/vestriservers join Survival-1
+/vestriservers delete BedWars-1 --confirm
+/vestriservers retry
+/vestriservers retry Survival-pending-1
+/vestripause BedWars-1
+/vestriservers invite Survival-1 Friend
+/vestriservers revoke Survival-1 Friend
 ```
 
 - **Permanent** servers remain registered and running when empty. Owners may
@@ -96,11 +100,78 @@ still obey configuration and per-user limits.
   servers, and disabling pause does not remove existing retention; owners can
   still toggle it off. Disabling `enabled` prevents new owned spawns but does
   not disable management or cleanup of existing owned servers.
-- List output includes template, lifecycle type, state, pause status, and server
-  UUID, with a remaining-seconds countdown for pending deletion. A pending spawn
-  shows its request UUID instead. Join/delete/retry accept
-  an owner's saved request UUID as well as the instance UUID. Deletion requires
-  `--confirm` and refuses occupied servers. Completion offers only your IDs.
+- Player messages use colored status text and friendly server names, not UUIDs
+  or internal Docker addresses. List output includes ownership/invited access,
+  lifecycle type, state, and pause status, with a remaining-seconds countdown
+  for pending deletion. Permitted joins are clickable in the list. Pending
+  spawns have a temporary name such as `Survival-pending-1`; successful spawns
+  use the backend's actual name such as `Survival-1`. Old saved records are
+  assigned safe local names and resolved to registered names when available.
+  Completion only offers names visible to that player. Deletion requires
+  `--confirm` and refuses occupied servers. `/vestriservers retry` without a
+  name retries the owner's single pending spawn; if more than one is pending,
+  choose its name from the list. Legacy IDs still work as input for authorized
+  users, but are never shown in player-facing output.
+
+### Invitations and Join Access
+
+Owners can invite an online player to a created **permanent** server:
+
+```text
+/vestriservers invite Survival-1 Friend
+```
+
+The invitation is stored by Minecraft player UUID in the ownership registry and
+survives proxy restarts. The invited player can use
+`/vestriservers join Survival-1` even when the owner is offline. They need the
+base and ordinary join permissions; an invitation grants access to the server,
+not command permissions. The first invitation requires the guest to be online
+so the proxy can obtain their authenticated UUID. Player names changing later
+do not change UUID-based access.
+
+Only the owner can issue or revoke invitations. Guests cannot delete, pause,
+invite others, or retry another owner's pending spawn, even if they hold those
+command permissions. `/vestriservers revoke Survival-1 Friend` removes an
+invitation and works while the guest is offline; use the guest's saved name
+shown in the owner's server list. Revocation blocks subsequent joins and
+cancels a join still waiting for readiness. It does not kick players who have
+already connected. Temporary servers do not accept persistent invitations.
+
+The ordinary join command accepts **only owned or invited** servers. Admin join
+permission bypasses this ownership/invitation check but does not grant ownership
+or other management rights. Both normal and admin joins still respect expired
+deletion windows and unavailable/deleting servers. Access and join permissions
+are rechecked while the transfer waits for Minecraft readiness.
+
+The plugin does not grant or register `/server`. Trusted transfers initiated by
+your party plugin or another proxy plugin remain separate from these player
+commands. Keep `/server` restricted in its owning plugin as before.
+
+### Velocity Permissions
+
+Configure these on the proxy, for example through Velocity LuckPerms. All are
+explicit checks; the base permission is required alongside an action permission.
+
+| Permission | Allows |
+| --- | --- |
+| `vestri.servers` | Base access to player server commands |
+| `vestri.servers.list` | List owned and invited servers (all managed servers for join admins) |
+| `vestri.servers.spawn.permanent` | Create permanent servers |
+| `vestri.servers.spawn.temporary` | Create temporary servers |
+| `vestri.servers.retry` | Retry an owner's pending spawn; reconnecting an existing server also needs join permission |
+| `vestri.servers.join` | Join owned or invited servers |
+| `vestri.servers.join.admin` | Join any managed server; replaces the ordinary join permission for admins |
+| `vestri.servers.delete` | Delete owned, empty servers with confirmation |
+| `vestri.servers.pause` | Toggle retention for owned temporary servers |
+| `vestri.servers.invite` | Invite players to owned permanent servers |
+| `vestri.servers.revoke` | Revoke invitations on owned servers |
+
+For a guest-only role, grant `vestri.servers`, `vestri.servers.list`, and
+`vestri.servers.join`. Grant `vestri.servers.join.admin` only to staff who should
+access every server. There is no default OP/player bypass. Console bridge
+commands remain console-only and trusted; clicking a console-action NPC is
+controlled by that NPC plugin's interaction permissions, not by the selected
+player's spawn permissions.
 
 For an owned **console or NPC** spawn, select both a lifecycle type and owner:
 
@@ -138,8 +209,9 @@ saved. Deadlines survive proxy restarts and are not extended by downtime;
 expired instances are cleaned up after the proxy resumes. Failed power
 or deletion requests preserve retryable records and maintenance backs off for
 one minute. A missing backend instance is treated as already deleted. Unknown
-spawn outcomes keep their quota reservation: retry the saved request UUID before
-deleting rather than creating a fresh request. Requests and pause state survive
+spawn outcomes keep their quota reservation: use `/vestriservers retry` or the
+pending server's name before deleting rather than creating a fresh request.
+Internally this always reuses the saved request UUID. Requests and pause state survive
 proxy restarts; automatic empty maintenance runs only while this proxy is up.
 
 Untyped console spawns (including existing `--send-player` commands), existing
@@ -252,17 +324,22 @@ vestridynamic list Bed Wars
 vestridynamic delete Bed Wars --confirm
 vestridynamic delete Bed Wars --instance <server UUID> --confirm
 vestridynamic spawn Bed Wars --request-id <request UUID>
-vestridynamic spawn Bed Wars --send-player Luis
-vestridynamic spawn Bed Wars --send-player Luis --request-id <request UUID>
+vestridynamic spawn Bed Wars --send-player {player}
+vestridynamic spawn Bed Wars --send-player {player} --request-id <request UUID>
 vestridynamic sync
 ```
 
 - `templates` lists configured aliases, not all templates in the panel.
 - `spawn` copies the saved template, starts the server, and synchronizes Velocity
   through the existing backend/worker pipeline. Success reports a server UUID and
-  means **starting**, not ready for players. The command prints a request UUID
-  before contacting the API. If it fails or times out, retry with that same UUID
-  and the same template/key instead of issuing a fresh spawn.
+  means **starting**, not ready for players. The plugin automatically retries
+  HTTP 502/503/504 spawn responses up to two times with the exact same request
+  UUID and template key. This recovers post-creation start/reload failures
+  without allocating a second instance. Authorization, validation, and quota
+  errors are not automatically retried. If all attempts fail, owned instances
+  remain reserved and can be retried by name. Operator diagnostic logs retain
+  request UUIDs for untyped console retries and backend correlation; player
+  chat never includes those UUIDs.
 - `spawn ... --send-player <player name>` first checks that the player is online
   on this proxy, then spawns normally. After the API returns, it waits up to five
   minutes for that exact instance to appear in Velocity and answer a Minecraft
@@ -438,6 +515,13 @@ failed pings, readiness expiry, disconnected/reconnected sessions, registry
 changes during a ping, stable-readiness warmup and resets, refused-connection
 retries, UUID-free player messages, successful transfers, and rejected connections.
 Countdown tests also cover tick order, one-second scheduling, readiness resets,
-and disconnect cancellation. Validate
+and disconnect cancellation. Owned-server tests cover named chat/completion,
+per-action permissions, permanent invitations, offline-owner joins, admin join
+bypass, owner-only management, persisted invitation revocation, queued transfer
+cancellation, and automatic same-request recovery of an initial NPC spawn 502.
+The Go backend logs post-commit failures with their start/reload stage and safe
+worker error classification. The exact cause of a live post-creation 502 requires
+correlated backend/worker logs; fake API tests verify recovery, not a claim that
+every worker or network failure is eliminated. Validate
 actual container startup, proxy forwarding, and NPC interaction on your network
 after deploying the updated JAR to both the proxy and the NPC's backend.

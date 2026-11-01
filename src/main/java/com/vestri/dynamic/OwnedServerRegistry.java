@@ -10,6 +10,8 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 final class OwnedServerRegistry {
     enum Type { PERMANENT, TEMPORARY }
@@ -22,6 +24,8 @@ final class OwnedServerRegistry {
         Type type;
         String serverId;
         String slug;
+        String name;
+        Map<UUID, String> invited = new LinkedHashMap<>();
         boolean paused;
         State state;
         long idleSince;
@@ -29,7 +33,16 @@ final class OwnedServerRegistry {
         long deleteAfter;
 
         MinecraftInstanceClient.SpawnedInstance target() {
-            return new MinecraftInstanceClient.SpawnedInstance(serverId, slug);
+            return new MinecraftInstanceClient.SpawnedInstance(serverId, slug,
+                    name != null && name.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[1-9][0-9]*") ? name : null);
+        }
+
+        String displayName() {
+            return name == null ? template : name;
+        }
+
+        boolean canJoin(UUID player, boolean admin) {
+            return admin || owner.equals(player) || invited.containsKey(player);
         }
     }
 
@@ -60,6 +73,21 @@ final class OwnedServerRegistry {
                         throw new IllegalArgumentException();
                     }
                     if (entry.state == State.PENDING_DELETION && entry.deleteAfter <= 0) {
+                        throw new IllegalArgumentException();
+                    }
+                    if (entry.invited == null) {
+                        entry.invited = new LinkedHashMap<>();
+                    }
+                    if (entry.name == null) {
+                        String prefix = entry.template.replaceAll("[^A-Za-z0-9_-]", "").replaceAll("^[_-]+", "");
+                        prefix = prefix.isEmpty() ? "Server" : prefix.substring(0, Math.min(prefix.length(), 48));
+                        entry.name = prefix + "-saved-" + (entries.size() + 1);
+                    }
+                    if (entry.name != null && !entry.name.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,79}")) {
+                        throw new IllegalArgumentException();
+                    }
+                    if (entry.invited.size() > 100 || entry.invited.entrySet().stream().anyMatch(invite -> invite.getKey() == null
+                            || invite.getValue() == null || !invite.getValue().matches("[A-Za-z0-9_]{1,16}"))) {
                         throw new IllegalArgumentException();
                     }
                     entries.add(entry);
@@ -98,6 +126,17 @@ final class OwnedServerRegistry {
         entry.template = template;
         entry.type = type;
         entry.requestId = requestId;
+        String prefix = template.replaceAll("[^A-Za-z0-9_-]", "").replaceAll("^[_-]+", "");
+        if (prefix.isEmpty()) {
+            prefix = "Server";
+        }
+        prefix = prefix.substring(0, Math.min(prefix.length(), 48));
+        int sequence = 1;
+        String candidate = prefix + "-pending-" + sequence;
+        while (nameExists(candidate)) {
+            candidate = prefix + "-pending-" + ++sequence;
+        }
+        entry.name = candidate;
         entry.state = State.PROVISIONING;
         entries.add(entry);
         try {
@@ -110,8 +149,57 @@ final class OwnedServerRegistry {
     }
 
     synchronized Entry require(UUID owner, String id) throws IOException {
-        return owned(owner).stream().filter(entry -> id.equals(entry.serverId) || id.equals(entry.requestId.toString()))
-                .findFirst().orElseThrow(() -> new IOException("You do not own that server. Use /vestriservers list."));
+        return select(owned(owner), id, "You do not own that server. Check your server list.");
+    }
+
+    synchronized List<Entry> accessible(UUID player, boolean admin) {
+        return entries.stream().filter(entry -> entry.canJoin(player, admin)).toList();
+    }
+
+    synchronized Entry requireJoin(UUID player, String name, boolean admin) throws IOException {
+        return select(accessible(player, admin), name, "You can only join your own servers or servers you were invited to.");
+    }
+
+    private boolean nameExists(String name) {
+        return entries.stream().anyMatch(entry -> name.equalsIgnoreCase(entry.displayName()));
+    }
+
+    private static Entry select(List<Entry> candidates, String name, String error) throws IOException {
+        List<Entry> selected = candidates.stream().filter(entry -> name.equalsIgnoreCase(entry.displayName())
+                || name.equals(entry.serverId) || name.equals(entry.requestId.toString())).toList();
+        if (selected.size() != 1) {
+            throw new IOException(selected.isEmpty() ? error : "That server name is ambiguous. Contact an administrator.");
+        }
+        return selected.get(0);
+    }
+
+    synchronized void invite(Entry entry, UUID player, String username) throws IOException {
+        if (entry.invited.size() >= 100 && !entry.invited.containsKey(player)) {
+            throw new IOException("This server has reached its invitation limit.");
+        }
+        String previous = entry.invited.put(player, username);
+        try {
+            save();
+        } catch (IOException failure) {
+            if (previous == null) {
+                entry.invited.remove(player);
+            } else {
+                entry.invited.put(player, previous);
+            }
+            throw failure;
+        }
+    }
+
+    synchronized void revoke(Entry entry, String username) throws IOException {
+        UUID player = entry.invited.entrySet().stream().filter(invite -> invite.getValue().equalsIgnoreCase(username))
+                .map(Map.Entry::getKey).findFirst().orElseThrow(() -> new IOException("That player is not invited to this server."));
+        String previous = entry.invited.remove(player);
+        try {
+            save();
+        } catch (IOException failure) {
+            entry.invited.put(player, previous);
+            throw failure;
+        }
     }
 
     synchronized void remove(Entry entry) throws IOException {

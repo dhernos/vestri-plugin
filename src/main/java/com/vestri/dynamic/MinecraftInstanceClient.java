@@ -137,17 +137,25 @@ final class MinecraftInstanceClient {
         JsonObject result = spawnResponse(template, requestId);
         String serverId = UUID.fromString(result.get("serverId").getAsString()).toString();
         try {
-            return new SpawnedInstance(serverId, result.get("slug").getAsString());
+            return new SpawnedInstance(serverId, result.get("slug").getAsString(),
+                    result.has("name") ? result.get("name").getAsString() : null);
         } catch (RuntimeException failure) {
             throw new IOException("Instance " + serverId + " was spawned, but its connection target is invalid; check the panel before retrying");
         }
     }
 
-    record SpawnedInstance(String serverId, String slug) {
+    record SpawnedInstance(String serverId, String slug, String name) {
+        SpawnedInstance(String serverId, String slug) {
+            this(serverId, slug, null);
+        }
+
         SpawnedInstance {
             UUID.fromString(serverId);
             if (slug == null || !slug.matches("mcgame-[a-f0-9]{32}")) {
                 throw new IllegalArgumentException("Invalid instance slug");
+            }
+            if (name != null && !name.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[1-9][0-9]*")) {
+                throw new IllegalArgumentException("Invalid server name");
             }
         }
     }
@@ -155,7 +163,15 @@ final class MinecraftInstanceClient {
     private JsonObject spawnResponse(String template, UUID requestId) throws IOException, InterruptedException {
         JsonObject body = new JsonObject();
         body.addProperty("requestId", requestId.toString());
-        return request(template, "POST", "", body.toString());
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return request(template, "POST", "", body.toString());
+            } catch (APIException failure) {
+                if (attempt >= 2 || !List.of(502, 503, 504).contains(failure.status)) {
+                    throw failure;
+                }
+            }
+        }
     }
 
     List<String> instances(String template) throws IOException, InterruptedException {
