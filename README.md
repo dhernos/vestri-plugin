@@ -152,19 +152,19 @@ commands. Keep `/server` restricted in its owning plugin as before.
 Configure these on the proxy, for example through Velocity LuckPerms. All are
 explicit checks; the base permission is required alongside an action permission.
 
-| Permission | Allows |
-| --- | --- |
-| `vestri.servers` | Base access to player server commands |
-| `vestri.servers.list` | List owned and invited servers (all managed servers for join admins) |
-| `vestri.servers.spawn.permanent` | Create permanent servers |
-| `vestri.servers.spawn.temporary` | Create temporary servers |
-| `vestri.servers.retry` | Retry an owner's pending spawn; reconnecting an existing server also needs join permission |
-| `vestri.servers.join` | Join owned or invited servers |
-| `vestri.servers.join.admin` | Join any managed server; replaces the ordinary join permission for admins |
-| `vestri.servers.delete` | Delete owned, empty servers with confirmation |
-| `vestri.servers.pause` | Toggle retention for owned temporary servers |
-| `vestri.servers.invite` | Invite players to owned permanent servers |
-| `vestri.servers.revoke` | Revoke invitations on owned servers |
+| Permission                       | Allows                                                                                     |
+| -------------------------------- | ------------------------------------------------------------------------------------------ |
+| `vestri.servers`                 | Base access to player server commands                                                      |
+| `vestri.servers.list`            | List owned and invited servers (all managed servers for join admins)                       |
+| `vestri.servers.spawn.permanent` | Create permanent servers                                                                   |
+| `vestri.servers.spawn.temporary` | Create temporary servers                                                                   |
+| `vestri.servers.retry`           | Retry an owner's pending spawn; reconnecting an existing server also needs join permission |
+| `vestri.servers.join`            | Join owned or invited servers                                                              |
+| `vestri.servers.join.admin`      | Join any managed server; replaces the ordinary join permission for admins                  |
+| `vestri.servers.delete`          | Delete owned, empty servers with confirmation                                              |
+| `vestri.servers.pause`           | Toggle retention for owned temporary servers                                               |
+| `vestri.servers.invite`          | Invite players to owned permanent servers                                                  |
+| `vestri.servers.revoke`          | Revoke invitations on owned servers                                                        |
 
 For a guest-only role, grant `vestri.servers`, `vestri.servers.list`, and
 `vestri.servers.join`. Grant `vestri.servers.join.admin` only to staff who should
