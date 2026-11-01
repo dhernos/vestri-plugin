@@ -105,9 +105,9 @@ still obey configuration and per-user limits.
 For an owned **console or NPC** spawn, select both a lifecycle type and owner:
 
 ```text
-vestridynamic spawn Survival --type permanent --send-player Luis
+vestridynamic spawn Survival --type permanent --send-player {player}
 vestridynamic spawn Bed Wars --type temporary --send-player {player}
-vestridynamic spawn Survival --type permanent --send-player Luis --request-id <request UUID>
+vestridynamic spawn Survival --type permanent --send-player {player} --request-id <request UUID>
 ```
 
 `{player}` is an NPC placeholder, not literal Velocity syntax. The owner must be
