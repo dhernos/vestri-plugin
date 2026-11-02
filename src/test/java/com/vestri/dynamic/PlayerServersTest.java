@@ -41,6 +41,8 @@ class PlayerServersTest {
     private UUID spawnedId;
     private String spawnBody;
     private int transientSpawnFailures;
+    private String preparationResponse = "{\"instance\":null}";
+    private int deletionStatus;
     private final List<String> spawnRequests = new ArrayList<>();
 
     @BeforeEach
@@ -57,8 +59,14 @@ class PlayerServersTest {
             }
             String body = spawning ? "{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32)
                     + "\",\"name\":\"Survival-1\"}" : "{}";
+            if (exchange.getRequestURI().getPath().contains("/requests/")) {
+                body = preparationResponse;
+            }
             byte[] response = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             int responseCode = spawning && transientSpawnFailures-- > 0 ? 502 : apiStatus;
+            if ("DELETE".equals(exchange.getRequestMethod()) && deletionStatus != 0) {
+                responseCode = deletionStatus;
+            }
             exchange.sendResponseHeaders(responseCode, response.length);
             exchange.getResponseBody().write(response);
             exchange.close();
@@ -183,6 +191,147 @@ class PlayerServersTest {
     }
 
     @Test
+        void ownerCanDeletePendingPreparationWithoutRetryingOrSpawning() throws Exception {
+        var pending = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.TEMPORARY, 1);
+            assertEquals(List.of(pending.name), service.suggest(invocation("delete", "")));
+            UUID owner = player.getUniqueId();
+            when(player.getUniqueId()).thenReturn(UUID.randomUUID());
+            service.execute(invocation("delete", pending.name, "--confirm"));
+            assertTrue(calls.isEmpty());
+            assertEquals(1, registry.all().size());
+            when(player.getUniqueId()).thenReturn(owner);
+        service.execute(invocation("delete", pending.name));
+        assertTrue(calls.isEmpty());
+        service.execute(invocation("delete", pending.name, "--confirm"));
+        assertTrue(registry.all().isEmpty());
+        assertEquals(List.of("GET /api/minecraft/v1/instances/requests/" + pending.requestId), calls);
+        assertTrue(spawnRequests.isEmpty());
+        }
+
+        @Test
+        void pendingDeletionResolvesCreatedInstanceAndRefusesOccupiedServer() throws Exception {
+        var pending = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.PERMANENT, 1);
+        preparationResponse = "{\"instance\":{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32)
+            + "\",\"name\":\"Survival-1\"}}";
+        when(target.getPlayersConnected()).thenReturn(List.of(player));
+        service.execute(invocation("delete", pending.name, "--confirm"));
+        assertEquals(1, registry.all().size());
+        assertEquals(OwnedServerRegistry.State.PROVISIONING, pending.state);
+        assertEquals(spawnedId.toString(), pending.serverId);
+        assertEquals(1, calls.size());
+        when(target.getPlayersConnected()).thenReturn(List.of());
+        service.execute(invocation("delete", pending.name, "--confirm"));
+        assertTrue(registry.all().isEmpty());
+        assertEquals(List.of("GET /api/minecraft/v1/instances/requests/" + pending.requestId,
+            "DELETE /api/minecraft/v1/instances/" + spawnedId), calls);
+        assertTrue(spawnRequests.isEmpty());
+        }
+
+        @Test
+        void preparationTimeoutSurvivesRestartAndCleansPermanentAndTemporaryReservations() throws Exception {
+        var permanent = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.PERMANENT, 1);
+        var temporary = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.TEMPORARY, 1);
+        service.sweep();
+        assertEquals(clock.get() + 300000, permanent.preparationDeleteAfter);
+        assertEquals(permanent.preparationDeleteAfter, temporary.preparationDeleteAfter);
+        assertTrue(calls.isEmpty());
+        var restored = new OwnedServerRegistry(directory.resolve("owned.json"));
+        service = new PlayerServers(proxy, configuration, restored, new SpawnPlayerTransfer(proxy, (task, delay) -> {}),
+            Runnable::run, mock(Logger.class), clock::get);
+        clock.addAndGet(299999);
+        service.sweep();
+        assertTrue(calls.isEmpty());
+        clock.incrementAndGet();
+        service.sweep();
+        assertTrue(restored.all().isEmpty());
+        assertEquals(2, calls.size());
+        assertTrue(calls.stream().allMatch(call -> call.startsWith("GET ")));
+        }
+
+        @Test
+        void timedOutPreparationDeletesBackendInstanceAndRetainsFailedDeletionForRetry() throws Exception {
+        var pending = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.PERMANENT, 1);
+        pending.preparationDeleteAfter = clock.get();
+        preparationResponse = "{\"instance\":{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32)
+            + "\",\"name\":\"Survival-1\"}}";
+        deletionStatus = 502;
+        service.sweep();
+        assertEquals(OwnedServerRegistry.State.DELETING, pending.state);
+        assertEquals(1, new OwnedServerRegistry(directory.resolve("owned.json")).all().size());
+        service.sweep();
+        assertEquals(2, calls.size());
+        clock.addAndGet(60001);
+        deletionStatus = 404;
+        service.sweep();
+        assertTrue(registry.all().isEmpty());
+        assertEquals(List.of("GET /api/minecraft/v1/instances/requests/" + pending.requestId,
+            "DELETE /api/minecraft/v1/instances/" + spawnedId,
+            "DELETE /api/minecraft/v1/instances/" + spawnedId), calls);
+        }
+
+        @Test
+        void failedPreparationLookupKeepsQuotaAndRetriesAfterBackoff() throws Exception {
+        var pending = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.TEMPORARY, 1);
+        pending.preparationDeleteAfter = clock.get();
+        apiStatus = 503;
+        service.sweep();
+        assertEquals(1, registry.all().size());
+        assertThrows(java.io.IOException.class, () -> registry.reserve(player.getUniqueId(), "survival",
+            OwnedServerRegistry.Type.TEMPORARY, 1));
+        apiStatus = 200;
+        service.sweep();
+        assertEquals(1, calls.size());
+        clock.addAndGet(60001);
+        service.sweep();
+        assertTrue(registry.all().isEmpty());
+        assertEquals(2, calls.size());
+        }
+
+        @Test
+        void configuredPreparationTimerResetsOnFailureAndClearsAfterSuccessfulRetry() throws Exception {
+            var config = com.google.gson.JsonParser.parseString(Files.readString(configuration)).getAsJsonObject();
+            config.getAsJsonObject("playerServers").addProperty("preparationTimeoutSeconds", 12);
+            Files.writeString(configuration, config.toString());
+            apiStatus = 401;
+            service.execute(invocation("spawn", "permanent", "Survival"));
+            var pending = registry.all().get(0);
+            assertEquals(clock.get() + 12000, pending.preparationDeleteAfter);
+            clock.addAndGet(5000);
+            service.execute(invocation("retry", pending.name));
+            assertEquals(clock.get() + 12000, pending.preparationDeleteAfter);
+            assertEquals(pending.preparationDeleteAfter,
+                    new OwnedServerRegistry(directory.resolve("owned.json")).all().get(0).preparationDeleteAfter);
+            apiStatus = 200;
+            service.execute(invocation("retry", pending.name));
+            assertEquals(OwnedServerRegistry.State.ACTIVE, pending.state);
+            assertEquals(0, pending.preparationDeleteAfter);
+            int completedCalls = calls.size();
+            clock.addAndGet(12000);
+            service.sweep();
+            assertEquals(completedCalls, calls.size());
+            assertEquals(1, registry.all().size());
+        }
+
+        @Test
+        void automaticPreparationCleanupWaitsForRecoveredInstanceToBecomeEmpty() throws Exception {
+            var pending = registry.reserve(player.getUniqueId(), "survival", OwnedServerRegistry.Type.TEMPORARY, 1);
+            pending.preparationDeleteAfter = clock.get();
+            preparationResponse = "{\"instance\":{\"serverId\":\"" + spawnedId + "\",\"slug\":\"mcgame-" + "a".repeat(32)
+                    + "\",\"name\":\"Survival-1\"}}";
+            when(target.getPlayersConnected()).thenReturn(List.of(player));
+            service.sweep();
+            assertEquals(1, registry.all().size());
+            assertEquals(1, calls.size());
+            clock.addAndGet(60001);
+            service.sweep();
+            assertEquals(1, calls.size());
+            when(target.getPlayersConnected()).thenReturn(List.of());
+            service.sweep();
+            assertTrue(registry.all().isEmpty());
+            assertEquals("DELETE /api/minecraft/v1/instances/" + spawnedId, calls.get(1));
+        }
+
+        @Test
     void occupiedDeletionAndUnconfirmedDeletionAreRefused() throws Exception {
         var entry = entry(OwnedServerRegistry.Type.PERMANENT);
         service.execute(invocation("delete", entry.serverId));
@@ -499,13 +648,16 @@ class PlayerServersTest {
 
     @Test
     void npcSpawnAutomaticallyRecoversInitialGatewayErrorWithoutManualRetry() throws Exception {
-        transientSpawnFailures = 1;
+        transientSpawnFailures = 2;
+        when(player.hasPermission(anyString())).thenReturn(false);
         UUID requestId = UUID.randomUUID();
         service.spawnForConsole(player, LifecycleRequest.parse(new String[]{"spawn", "Survival", "--type", "temporary",
                 "--send-player", "Owner", "--request-id", requestId.toString()}));
-        assertEquals(2, spawnRequests.size());
-        assertEquals(spawnRequests.get(0), spawnRequests.get(1));
+        assertEquals(3, spawnRequests.size());
+        assertEquals(1, spawnRequests.stream().distinct().count());
         assertEquals(1, registry.all().size());
+        assertEquals(requestId, registry.all().get(0).requestId);
+        assertEquals(player.getUniqueId(), registry.all().get(0).owner);
         assertEquals(OwnedServerRegistry.State.ACTIVE, registry.all().get(0).state);
         assertEquals("Survival-1", registry.all().get(0).name);
         verify(target).ping();

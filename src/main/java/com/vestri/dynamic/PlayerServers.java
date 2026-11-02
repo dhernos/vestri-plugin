@@ -205,7 +205,9 @@ final class PlayerServers implements SimpleCommand {
                         + (entry.owner.equals(player.getUniqueId()) ? " | yours" : entry.invited.containsKey(player.getUniqueId()) ? " | invited" : " | admin")
                         + (entry.paused ? " | paused" : "")
                         + (entry.state == OwnedServerRegistry.State.PENDING_DELETION
-                            ? " | kept for " + Math.max(0, (entry.deleteAfter - clock.getAsLong() + 999) / 1000) + "s" : "");
+                            ? " | kept for " + Math.max(0, (entry.deleteAfter - clock.getAsLong() + 999) / 1000) + "s" : "")
+                        + (entry.state == OwnedServerRegistry.State.PROVISIONING && entry.preparationDeleteAfter > 0
+                            ? " | cleanup in " + Math.max(0, (entry.preparationDeleteAfter - clock.getAsLong() + 999) / 1000) + "s" : "");
                 Component row = Component.text(name, NamedTextColor.AQUA).append(Component.text("  " + detail, NamedTextColor.GRAY));
                 if (canUseJoin(player) && entry.serverId != null) {
                     row = row.clickEvent(ClickEvent.runCommand("/vestriservers join " + name))
@@ -276,14 +278,9 @@ final class PlayerServers implements SimpleCommand {
             message(player, arguments[2] + " can no longer join " + serverName(entry) + ".");
         } else if (arguments.length == 3 && arguments[0].equals("delete") && arguments[2].equals("--confirm")) {
             var entry = registry.require(player.getUniqueId(), arguments[1]);
-            if (entry.serverId == null) {
-                throw new IOException("Your server is still being prepared. Use /vestriservers retry " + serverName(entry) + " first.");
-            }
             if (occupied(entry)) {
                 throw new IOException("Server is occupied. All players must leave before it can be deleted.");
             }
-            entry.state = OwnedServerRegistry.State.DELETING;
-            registry.save();
             delete(entry, MinecraftInstanceClient.load(configuration));
             message(player, serverName(entry) + " has been deleted.");
         } else {
@@ -293,13 +290,28 @@ final class PlayerServers implements SimpleCommand {
 
     private void spawn(Player player, OwnedServerRegistry.Entry entry, MinecraftInstanceClient client)
             throws IOException, InterruptedException {
-        var instance = client.spawnWithTarget(entry.template, entry.requestId);
+        long timeout = Duration.ofSeconds(PlayerServerPolicy.load(configuration).preparationTimeoutSeconds()).toMillis();
+        entry.preparationDeleteAfter = clock.getAsLong() + timeout;
+        registry.save();
+        MinecraftInstanceClient.SpawnedInstance instance;
+        try {
+            instance = client.spawnWithTarget(entry.template, entry.requestId);
+        } catch (IOException | InterruptedException | RuntimeException failure) {
+            entry.preparationDeleteAfter = clock.getAsLong() + timeout;
+            try {
+                registry.save();
+            } catch (IOException persistenceFailure) {
+                failure.addSuppressed(persistenceFailure);
+            }
+            throw failure;
+        }
         entry.serverId = instance.serverId();
         entry.slug = instance.slug();
         if (instance.name() != null) {
             entry.name = instance.name();
         }
         entry.state = OwnedServerRegistry.State.ACTIVE;
+        entry.preparationDeleteAfter = 0;
         entry.joinUntil = clock.getAsLong() + JOIN_WINDOW;
         registry.save();
         message(player, serverName(entry) + " is starting. Your connection will begin shortly.");
@@ -452,6 +464,18 @@ final class PlayerServers implements SimpleCommand {
         try {
             PlayerServerPolicy policy = PlayerServerPolicy.load(configuration);
             for (var entry : registry.all()) {
+                if (entry.state == OwnedServerRegistry.State.PROVISIONING) {
+                    if (entry.preparationDeleteAfter == 0) {
+                        entry.preparationDeleteAfter = clock.getAsLong()
+                                + Duration.ofSeconds(policy.preparationTimeoutSeconds()).toMillis();
+                        registry.save();
+                    } else if (clock.getAsLong() >= entry.preparationDeleteAfter && !occupied(entry)) {
+                        delete(entry, MinecraftInstanceClient.load(configuration));
+                        proxy.getPlayer(entry.owner).filter(Player::isActive).ifPresent(owner -> message(owner,
+                                "Removed failed preparation " + serverName(entry) + "."));
+                    }
+                    continue;
+                }
                 if (entry.serverId == null || entry.type == OwnedServerRegistry.Type.PERMANENT
                         && entry.state != OwnedServerRegistry.State.DELETING) {
                     continue;
@@ -527,6 +551,24 @@ final class PlayerServers implements SimpleCommand {
     }
 
     private void delete(OwnedServerRegistry.Entry entry, MinecraftInstanceClient client) throws IOException, InterruptedException {
+        if (entry.serverId == null) {
+            var instance = client.findPreparation(entry.template, entry.requestId);
+            if (instance == null) {
+                registry.remove(entry);
+                return;
+            }
+            entry.serverId = instance.serverId();
+            entry.slug = instance.slug();
+            if (instance.name() != null) {
+                entry.name = instance.name();
+            }
+            registry.save();
+        }
+        if (occupied(entry)) {
+            throw new IOException("Server is occupied. All players must leave before it can be deleted.");
+        }
+        entry.state = OwnedServerRegistry.State.DELETING;
+        registry.save();
         client.deleteIfPresent(entry.template, UUID.fromString(entry.serverId));
         registry.remove(entry);
     }
@@ -556,7 +598,7 @@ final class PlayerServers implements SimpleCommand {
             logger.warn("Player server command failed: {}", failure.getMessage());
             String text = failure.getMessage();
             error(player, text != null && text.startsWith("Vestri API returned")
-                    ? "Your server couldn't finish starting. Try /vestriservers retry, or contact a staff member."
+                    ? "The server request failed. Use /vestriservers list to retry or delete it, or contact a staff member."
                     : text == null ? "We couldn't complete that request. Please try again." : text);
         } catch (RuntimeException failure) {
             message(player, "Invalid server configuration or API response. Contact an administrator.");

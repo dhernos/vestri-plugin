@@ -27,10 +27,21 @@ import java.util.HexFormat;
 final class MinecraftInstanceClient {
     private final URI endpoint;
     private final Map<String, String> templateKeys;
+    private final RetryDelay retryDelay;
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10)).followRedirects(HttpClient.Redirect.NEVER).build();
 
     MinecraftInstanceClient(URI backend, Map<String, String> keys) {
+        this(backend, keys, Thread::sleep);
+    }
+
+    @FunctionalInterface
+    interface RetryDelay {
+        void pause(long milliseconds) throws InterruptedException;
+    }
+
+    MinecraftInstanceClient(URI backend, Map<String, String> keys, RetryDelay retryDelay) {
+        this.retryDelay = retryDelay;
         String host = backend.getHost();
         boolean local = "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host)
                 || "[::1]".equals(host) || "::1".equals(host);
@@ -65,6 +76,7 @@ final class MinecraftInstanceClient {
         players.addProperty("maxPausedPerUser", 1);
         players.addProperty("emptyGraceSeconds", 30);
         players.addProperty("deletionGraceSeconds", 300);
+        players.addProperty("preparationTimeoutSeconds", 300);
         config.add("playerServers", players);
         byte[] secret = new byte[32];
         new SecureRandom().nextBytes(secret);
@@ -134,7 +146,22 @@ final class MinecraftInstanceClient {
     }
 
     SpawnedInstance spawnWithTarget(String template, UUID requestId) throws IOException, InterruptedException {
-        JsonObject result = spawnResponse(template, requestId);
+        return parseTarget(spawnResponse(template, requestId));
+    }
+
+    SpawnedInstance findPreparation(String template, UUID requestId) throws IOException, InterruptedException {
+        JsonObject response = request(template, "GET", "/requests/" + requestId, null);
+        if (!response.has("instance")) {
+            throw new IOException("Invalid preparation lookup response; cleanup will be retried.");
+        }
+        try {
+            return response.get("instance").isJsonNull() ? null : parseTarget(response.getAsJsonObject("instance"));
+        } catch (RuntimeException failure) {
+            throw new IOException("Invalid preparation lookup response; cleanup will be retried.");
+        }
+    }
+
+    private SpawnedInstance parseTarget(JsonObject result) throws IOException {
         String serverId = UUID.fromString(result.get("serverId").getAsString()).toString();
         try {
             return new SpawnedInstance(serverId, result.get("slug").getAsString(),
@@ -170,6 +197,7 @@ final class MinecraftInstanceClient {
                 if (attempt >= 2 || !List.of(502, 503, 504).contains(failure.status)) {
                     throw failure;
                 }
+                retryDelay.pause(5000L * (attempt + 1));
             }
         }
     }
@@ -218,9 +246,36 @@ final class MinecraftInstanceClient {
     private static final class APIException extends IOException {
         private final int status;
 
-        APIException(int status) {
-            super("Vestri API returned HTTP " + status + "; check key expiry, template limits, and backend logs");
+        APIException(int status, String body) {
+            super("Vestri API returned HTTP " + status + failureDetail(body) + "; check backend logs for this requestId");
             this.status = status;
+        }
+
+        private static String failureDetail(String body) {
+            try {
+                String message = JsonParser.parseString(body).getAsJsonObject().get("message").getAsString();
+                return switch (message) {
+                    case "Invalid worker configuration",
+                         "Velocity bridge is unavailable; install Vestri Dynamic Servers and start the proxy",
+                         "Failed to copy server template",
+                         "Failed to read server properties",
+                         "Failed to reset random world",
+                         "Failed to reset world identity",
+                         "Failed to write server properties",
+                         "Failed to write instance configuration",
+                         "Failed to install Vestri plugin; retry the same requestId",
+                         "Failed to register instance with Velocity",
+                         "Failed to read proxy configuration",
+                         "Failed to preserve Velocity fallback targets",
+                         "Failed to configure Velocity forwarding",
+                         "Instance was created but could not start; retry the same requestId or delete it",
+                         "Instance could not start; retry with the same requestId or delete it",
+                         "Instance exists, but Velocity could not reload; retry the same requestId" -> ": " + message;
+                    default -> "";
+                };
+            } catch (RuntimeException failure) {
+                return "";
+            }
         }
     }
 
@@ -240,7 +295,7 @@ final class MinecraftInstanceClient {
                 ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body)).build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new APIException(response.statusCode());
+            throw new APIException(response.statusCode(), response.body());
         }
         if ("DELETE".equals(method)) {
             return new JsonObject();

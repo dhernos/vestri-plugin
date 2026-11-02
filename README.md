@@ -36,7 +36,8 @@ the proxy's existing `vestri-dynamic-config.json`:
   "pauseEnabled": true,
   "maxPausedPerUser": 1,
   "emptyGraceSeconds": 30,
-  "deletionGraceSeconds": 300
+  "deletionGraceSeconds": 300,
+  "preparationTimeoutSeconds": 300
 }
 ```
 
@@ -55,6 +56,7 @@ still obey configuration and per-user limits.
 /vestriservers list
 /vestriservers join Survival-1
 /vestriservers delete BedWars-1 --confirm
+/vestriservers delete Survival-pending-1 --confirm
 /vestriservers retry
 /vestriservers retry Survival-pending-1
 /vestripause BedWars-1
@@ -112,6 +114,15 @@ still obey configuration and per-user limits.
   name retries the owner's single pending spawn; if more than one is pending,
   choose its name from the list. Legacy IDs still work as input for authorized
   users, but are never shown in player-facing output.
+- **Failed preparations** can be deleted immediately by their pending name with
+  `/vestriservers delete <name> --confirm`; retrying first is not required.
+  Otherwise maintenance cleans them up after `preparationTimeoutSeconds`
+  (300 seconds by default), for both permanent and temporary requests. The list
+  shows the remaining cleanup countdown. Cleanup resolves the original request
+  UUID using the original template key, deletes any created empty instance and
+  its files, and then releases the quota reservation. It never creates or starts
+  an instance just to delete it. Occupied instances are preserved; lookup or
+  deletion failures retain the record and retry with maintenance backoff.
 
 ### Invitations and Join Access
 
@@ -209,9 +220,15 @@ saved. Deadlines survive proxy restarts and are not extended by downtime;
 expired instances are cleaned up after the proxy resumes. Failed power
 or deletion requests preserve retryable records and maintenance backs off for
 one minute. A missing backend instance is treated as already deleted. Unknown
-spawn outcomes keep their quota reservation: use `/vestriservers retry` or the
-pending server's name before deleting rather than creating a fresh request.
-Internally this always reuses the saved request UUID. Requests and pause state survive
+spawn outcomes keep their quota reservation until retried successfully or safely
+cleaned up. Use `/vestriservers retry`, or delete the pending name with
+`/vestriservers delete <name> --confirm`, rather than creating a fresh request.
+Each failed preparation starts a persisted `preparationTimeoutSeconds` cleanup
+deadline; another failed retry resets it, and success cancels it. Requests still
+in progress are serialized with cleanup, so maintenance cannot delete a spawn
+while it is running. Existing pending records without a deadline receive a full
+timeout on the first maintenance pass after upgrading. Saved deadlines survive
+restarts and are not extended by downtime or later setting changes. Requests and pause state survive
 proxy restarts; automatic empty maintenance runs only while this proxy is up.
 
 Untyped console spawns (including existing `--send-player` commands), existing
@@ -225,6 +242,13 @@ template-key-scoped `POST /api/minecraft/v1/instances/{instanceId}/stop` and
 preserve files and proxy registration. No worker API key is exposed to players
 or backend plugins. Existing API-key expiry, rate limits, and node/template
 instance limits still apply.
+
+Failed-preparation cleanup additionally requires the updated backend's
+template-key-scoped `GET /api/minecraft/v1/instances/requests/{requestId}` lookup.
+Deploy the backend before enabling the updated proxy JAR. An unavailable or
+older backend leaves pending records intact rather than assuming their instances
+do not exist. `preparationTimeoutSeconds` must be between 1 and 86400 seconds;
+omitting it uses 300. Successfully prepared servers retain their normal lifecycle.
 
 ## Numbered server names
 
@@ -334,8 +358,10 @@ vestridynamic sync
   through the existing backend/worker pipeline. Success reports a server UUID and
   means **starting**, not ready for players. The plugin automatically retries
   HTTP 502/503/504 spawn responses up to two times with the exact same request
-  UUID and template key. This recovers post-creation start/reload failures
-  without allocating a second instance. Authorization, validation, and quota
+  UUID and template key, waiting five seconds before the first retry and ten
+  seconds before the second. This gives transient failures time to clear and
+  can recover post-creation start/reload failures without allocating a second
+  instance. Authorization, validation, and quota
   errors are not automatically retried. If all attempts fail, owned instances
   remain reserved and can be retried by name. Operator diagnostic logs retain
   request UUIDs for untyped console retries and backend correlation; player
@@ -400,7 +426,30 @@ instances and instances created under a replaced key will not appear; manage
 those in the panel or with their original valid key. Keep the printed request UUID
 for a failed spawn, since provisioning or a proxy reload may have partially
 succeeded. API errors show an HTTP status without exposing response bodies or
-tokens; consult backend logs for details.
+tokens. Recognized backend failure messages also identify the failing operation,
+such as copying the template, starting the instance, or reloading Velocity;
+unrecognized response text is never printed. Consult backend logs for details.
+
+### Console Spawn Returns HTTP 502
+
+If the backend console prints `Forwarding` and Velocity prints `Preparing`, the
+console bridge delivered the command. A later HTTP 502 is a backend/upstream
+failure, not a missing player command permission. Owned console spawns and
+`/vestriservers retry` use the same API and saved request UUID; a successful
+manual retry can indicate a transient failure that cleared between attempts.
+
+`VESTRI_DYNAMIC_SYNC_OK` alone does not mean spawning succeeded: the backend
+checks the proxy bridge before copying a template and synchronizes it again
+after starting the new instance. Check the final API error for the failing
+operation and correlate the proxy's `Vestri spawn diagnostic` request UUID with
+backend/worker logs from the same time. Backend `post_commit_failure` records
+identify `stage=start` or `stage=reload` for failures after the instance is saved.
+
+Retry the pending server with `/vestriservers retry` (or its name when several
+are pending), or repeat the forwarded console command with its original
+`--request-id`. Clicking the NPC again normally generates a **new** request UUID
+and can create a separate server. Deploy the newly built JAR to Velocity and
+restart the proxy to activate delayed retries and improved error diagnostics.
 
 ## Backend console and FancyNPCs
 
@@ -519,6 +568,10 @@ and disconnect cancellation. Owned-server tests cover named chat/completion,
 per-action permissions, permanent invitations, offline-owner joins, admin join
 bypass, owner-only management, persisted invitation revocation, queued transfer
 cancellation, and automatic same-request recovery of an initial NPC spawn 502.
+Preparation cleanup tests cover confirmed owner deletion without provisioning,
+lost-response instance lookup, occupied-server protection, configurable deadlines,
+restart persistence, retry resets, successful-retry cancellation, and retained
+quota/backoff when lookup or deletion fails.
 The Go backend logs post-commit failures with their start/reload stage and safe
 worker error classification. The exact cause of a live post-creation 502 requires
 correlated backend/worker logs; fake API tests verify recovery, not a claim that

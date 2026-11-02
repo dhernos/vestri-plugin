@@ -39,6 +39,7 @@ class OwnedServerRegistryTest {
         Files.writeString(config, "{}");
         assertFalse(PlayerServerPolicy.load(config).enabled());
         assertEquals(300, PlayerServerPolicy.load(config).deletionGraceSeconds());
+        assertEquals(300, PlayerServerPolicy.load(config).preparationTimeoutSeconds());
         Files.writeString(config, "{\"playerServers\":{\"maxTemporaryPerUser\":-1}}");
         assertThrows(IOException.class, () -> PlayerServerPolicy.load(config));
         Files.writeString(config, "{\"playerServers\":{\"enabled\":true,\"maxTemporaryPerUser\":0}}");
@@ -60,6 +61,17 @@ class OwnedServerRegistryTest {
         entry.state = OwnedServerRegistry.State.PENDING_DELETION;
         registry.save();
         assertThrows(IOException.class, () -> new OwnedServerRegistry(file));
+    }
+
+    @Test
+    void preparationTimeoutIsConfigurableAndMustBePositive() throws Exception {
+        Path config = directory.resolve("config.json");
+        Files.writeString(config, "{\"playerServers\":{\"preparationTimeoutSeconds\":120}}");
+        assertEquals(120, PlayerServerPolicy.load(config).preparationTimeoutSeconds());
+        for (String invalid : java.util.List.of("0", "-1", "1.5", "86401")) {
+            Files.writeString(config, "{\"playerServers\":{\"preparationTimeoutSeconds\":" + invalid + "}}");
+            assertThrows(IOException.class, () -> PlayerServerPolicy.load(config));
+        }
     }
 
     @Test

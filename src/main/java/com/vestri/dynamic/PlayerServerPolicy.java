@@ -7,7 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 record PlayerServerPolicy(boolean enabled, int permanentLimit, int temporaryLimit,
-    boolean pauseEnabled, int pausedLimit, int emptyGraceSeconds, int deletionGraceSeconds) {
+    boolean pauseEnabled, int pausedLimit, int emptyGraceSeconds, int deletionGraceSeconds, int preparationTimeoutSeconds) {
     static PlayerServerPolicy load(Path file) throws IOException {
         if (Files.size(file) > 64 * 1024) {
             throw new IOException("Plugin configuration exceeds 64 KiB");
@@ -16,12 +16,12 @@ record PlayerServerPolicy(boolean enabled, int permanentLimit, int temporaryLimi
             JsonObject config = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
             JsonObject policy = config.getAsJsonObject("playerServers");
             if (policy == null) {
-                return new PlayerServerPolicy(false, 1, 2, true, 1, 30, 300);
+                return new PlayerServerPolicy(false, 1, 2, true, 1, 30, 300, 300);
             }
             return new PlayerServerPolicy(bool(policy, "enabled", false), number(policy, "maxPermanentPerUser", 1, 0),
                     number(policy, "maxTemporaryPerUser", 2, 0), bool(policy, "pauseEnabled", true),
                     number(policy, "maxPausedPerUser", 1, 0), number(policy, "emptyGraceSeconds", 30, 1),
-                    number(policy, "deletionGraceSeconds", 300, 1));
+                    number(policy, "deletionGraceSeconds", 300, 1), number(policy, "preparationTimeoutSeconds", 300, 1));
         } catch (RuntimeException failure) {
             throw new IOException("Invalid playerServers configuration");
         }
