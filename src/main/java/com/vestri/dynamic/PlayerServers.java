@@ -470,6 +470,8 @@ final class PlayerServers implements SimpleCommand {
                                 + Duration.ofSeconds(policy.preparationTimeoutSeconds()).toMillis();
                         registry.save();
                     } else if (clock.getAsLong() >= entry.preparationDeleteAfter && !occupied(entry)) {
+                        logger.info("Owned server maintenance action=delete reason=preparation_timeout server={} requestId={}",
+                                entry.serverId, entry.requestId);
                         delete(entry, MinecraftInstanceClient.load(configuration));
                         proxy.getPlayer(entry.owner).filter(Player::isActive).ifPresent(owner -> message(owner,
                                 "Removed failed preparation " + serverName(entry) + "."));
@@ -491,6 +493,7 @@ final class PlayerServers implements SimpleCommand {
                     continue;
                 }
                 if (entry.state == OwnedServerRegistry.State.DELETING) {
+                    logger.info("Owned server maintenance action=delete reason=retry_deletion server={}", entry.serverId);
                     delete(entry, MinecraftInstanceClient.load(configuration));
                     continue;
                 }
@@ -500,6 +503,7 @@ final class PlayerServers implements SimpleCommand {
                         entry.deleteAfter = 0;
                         registry.save();
                     } else if (clock.getAsLong() >= entry.deleteAfter) {
+                        logger.info("Owned server maintenance action=delete reason=rejoin_window_expired server={}", entry.serverId);
                         entry.state = OwnedServerRegistry.State.DELETING;
                         registry.save();
                         delete(entry, MinecraftInstanceClient.load(configuration));
@@ -532,6 +536,8 @@ final class PlayerServers implements SimpleCommand {
                 }
                 entry.state = OwnedServerRegistry.State.STOPPING;
                 registry.save();
+                logger.info("Owned server maintenance action=stop reason=empty server={} idleSeconds={} paused={}",
+                    entry.serverId, (now - entry.idleSince) / 1000, entry.paused);
                 client.power(entry.template, UUID.fromString(entry.serverId), false);
                 entry.state = entry.paused ? OwnedServerRegistry.State.STOPPED : OwnedServerRegistry.State.PENDING_DELETION;
                 entry.deleteAfter = entry.paused ? 0 : clock.getAsLong() + Duration.ofSeconds(policy.deletionGraceSeconds()).toMillis();
