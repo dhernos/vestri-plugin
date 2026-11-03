@@ -35,6 +35,9 @@ class MinecraftInstanceClientTest {
     private String spawnSlug;
     private int responseStatus;
     private int transientSpawnFailures;
+    private String errorBody;
+    private String preparationResponse = "{\"instance\":null}";
+    private final List<Long> retryDelays = new ArrayList<>();
     private final List<String> spawnRequests = new ArrayList<>();
 
     @Test
@@ -93,7 +96,7 @@ class MinecraftInstanceClientTest {
         server.createContext("/api/minecraft/v1/instances", exchange -> {
             assertEquals("Bearer " + key, exchange.getRequestHeaders().getFirst("Authorization"));
             calls.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
-            String body = listed;
+            String body = exchange.getRequestURI().getPath().contains("/requests/") ? preparationResponse : listed;
             if ("POST".equals(exchange.getRequestMethod())) {
                 spawnBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 spawnRequests.add(spawnBody);
@@ -105,6 +108,9 @@ class MinecraftInstanceClientTest {
             } else {
                 int statusCode = exchange.getRequestURI().getPath().equals("/api/minecraft/v1/instances")
                     && "POST".equals(exchange.getRequestMethod()) && transientSpawnFailures-- > 0 ? 502 : responseStatus;
+                if (statusCode >= 400 && errorBody != null) {
+                    bytes = errorBody.getBytes(StandardCharsets.UTF_8);
+                }
                 exchange.sendResponseHeaders(statusCode, bytes.length);
                 exchange.getResponseBody().write(bytes);
             }
@@ -112,7 +118,7 @@ class MinecraftInstanceClientTest {
         });
         server.start();
         client = new MinecraftInstanceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
-                Map.of("Bed Wars", key));
+            Map.of("Bed Wars", key), retryDelays::add);
     }
 
     @AfterEach
@@ -136,6 +142,7 @@ class MinecraftInstanceClientTest {
         assertEquals(2, spawnRequests.size());
         assertEquals(spawnRequests.get(0), spawnRequests.get(1));
         assertEquals(requestId.toString(), JsonParser.parseString(spawnRequests.get(1)).getAsJsonObject().get("requestId").getAsString());
+        assertEquals(List.of(5000L), retryDelays);
     }
 
     @Test
@@ -144,9 +151,50 @@ class MinecraftInstanceClientTest {
         assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
         assertEquals(3, spawnRequests.size());
         assertEquals(1, spawnRequests.stream().distinct().count());
+        assertEquals(List.of(5000L, 10000L), retryDelays);
         responseStatus = 401;
         assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
         assertEquals(4, spawnRequests.size());
+        assertEquals(List.of(5000L, 10000L), retryDelays);
+    }
+
+    @Test
+    void waitsForBackendRecoveryBeforeRetryingTheSameRequest() throws Exception {
+        responseStatus = 502;
+        client = new MinecraftInstanceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
+                Map.of("Bed Wars", key), milliseconds -> {
+                    retryDelays.add(milliseconds);
+                    responseStatus = 200;
+                });
+        assertEquals(instance.toString(), client.spawnWithTarget("Bed Wars", UUID.randomUUID()).serverId());
+        assertEquals(2, spawnRequests.size());
+        assertEquals(1, spawnRequests.stream().distinct().count());
+        assertEquals(List.of(5000L), retryDelays);
+    }
+
+    @Test
+    void interruptionDuringBackoffStopsFurtherRequests() {
+        responseStatus = 503;
+        client = new MinecraftInstanceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
+                Map.of("Bed Wars", key), milliseconds -> { throw new InterruptedException(); });
+        assertThrows(InterruptedException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
+        assertEquals(1, spawnRequests.size());
+    }
+
+    @Test
+    void reportsKnownFailureStageWithoutExposingArbitraryResponseBodies() {
+        responseStatus = 502;
+        errorBody = "{\"message\":\"Failed to copy server template\",\"secret\":\"" + key + "\"}";
+        IOException failure = assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
+        assertTrue(failure.getMessage().contains("Failed to copy server template"));
+        assertFalse(failure.getMessage().contains(key));
+        for (String body : List.of("<html>SECRET</html>", "{}", "{\"message\":\"SECRET " + key + "\"}")) {
+            errorBody = body;
+            failure = assertThrows(IOException.class, () -> client.spawn("Bed Wars", UUID.randomUUID()));
+            assertTrue(failure.getMessage().contains("HTTP 502"));
+            assertFalse(failure.getMessage().contains("SECRET"));
+            assertFalse(failure.getMessage().contains(key));
+        }
     }
 
     @Test
@@ -157,6 +205,33 @@ class MinecraftInstanceClientTest {
         spawnSlug = "lobby";
         IOException failure = assertThrows(IOException.class, () -> client.spawnWithTarget("Bed Wars", UUID.randomUUID()));
         assertTrue(failure.getMessage().contains(instance.toString()));
+    }
+
+    @Test
+    void looksUpPreparationWithoutStartingAnotherInstance() throws Exception {
+        UUID requestId = UUID.randomUUID();
+        assertEquals(null, client.findPreparation("Bed Wars", requestId));
+        preparationResponse = "{\"instance\":{\"serverId\":\"" + instance + "\",\"slug\":\"" + spawnSlug + "\"}}";
+        var target = client.findPreparation("Bed Wars", requestId);
+        assertEquals(instance.toString(), target.serverId());
+        assertEquals(spawnSlug, target.slug());
+        assertEquals(List.of("GET /api/minecraft/v1/instances/requests/" + requestId,
+                "GET /api/minecraft/v1/instances/requests/" + requestId), calls);
+        assertTrue(spawnRequests.isEmpty());
+    }
+
+    @Test
+    void failedOrUnsupportedPreparationLookupIsNotTreatedAsMissing() {
+        UUID requestId = UUID.randomUUID();
+        for (String invalid : List.of("{}", "{\"instance\":{}}", "{\"instance\":false}")) {
+            preparationResponse = invalid;
+            assertThrows(IOException.class, () -> client.findPreparation("Bed Wars", requestId));
+        }
+        responseStatus = 404;
+        assertThrows(IOException.class, () -> client.findPreparation("Bed Wars", requestId));
+        responseStatus = 503;
+        assertThrows(IOException.class, () -> client.findPreparation("Bed Wars", requestId));
+        assertTrue(spawnRequests.isEmpty());
     }
 
     @Test

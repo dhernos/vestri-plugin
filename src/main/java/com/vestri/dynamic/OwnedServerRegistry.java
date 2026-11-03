@@ -31,6 +31,7 @@ final class OwnedServerRegistry {
         long idleSince;
         long joinUntil;
         long deleteAfter;
+        long preparationDeleteAfter;
 
         MinecraftInstanceClient.SpawnedInstance target() {
             return new MinecraftInstanceClient.SpawnedInstance(serverId, slug,
@@ -63,7 +64,7 @@ final class OwnedServerRegistry {
                 }
                 for (Entry entry : saved) {
                     if (entry.owner == null || entry.requestId == null || entry.template == null
-                            || entry.type == null || entry.state == null || entries.stream().anyMatch(
+                            || entry.type == null || entry.state == null || entry.preparationDeleteAfter < 0 || entries.stream().anyMatch(
                                 existing -> existing.requestId.equals(entry.requestId))) {
                         throw new IllegalArgumentException();
                     }
