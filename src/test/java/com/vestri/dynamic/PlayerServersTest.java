@@ -393,6 +393,21 @@ class PlayerServersTest {
     }
 
     @Test
+    void makingRoomNeverDeletesPermanentServers() throws Exception {
+        var temporary = entry(OwnedServerRegistry.Type.TEMPORARY);
+        var permanent = entry(OwnedServerRegistry.Type.PERMANENT);
+        becomeEmpty();
+        permanent.state = OwnedServerRegistry.State.PENDING_DELETION;
+        permanent.deleteAfter = clock.get() + 60_000;
+        registry.save();
+        calls.clear();
+        service.execute(invocation("spawn", "temporary", "Survival"));
+        assertEquals(List.of("DELETE /api/minecraft/v1/instances/" + temporary.serverId, "POST /api/minecraft/v1/instances"), calls);
+        assertTrue(registry.all().contains(permanent));
+        assertFalse(registry.all().contains(temporary));
+    }
+
+    @Test
     void rejectedSpawnsDoNotDeletePendingServersAndOccupiedServersAreProtected() throws Exception {
         var old = entry(OwnedServerRegistry.Type.TEMPORARY);
         becomeEmpty();
