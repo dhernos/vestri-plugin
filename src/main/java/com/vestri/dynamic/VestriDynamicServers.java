@@ -7,6 +7,12 @@ import com.google.inject.Inject;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.EventTask;
+import com.velocitypowered.api.event.PostOrder;
+import com.velocitypowered.api.event.connection.PreLoginEvent;
+import com.velocitypowered.api.event.connection.LoginEvent;
+import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.player.KickedFromServerEvent;
+import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
@@ -30,7 +36,7 @@ import java.util.regex.Pattern;
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 
-@Plugin(id = "vestri-dynamic", name = "Vestri Dynamic Servers", version = "1.0.0")
+@Plugin(id = "vestri-dynamic", name = "Vestri Dynamic Servers", version = "1.1.0")
 public final class VestriDynamicServers {
     private static final Pattern SERVER_NAME = Pattern.compile("mcgame-[a-f0-9]{32}");
     private static final Pattern FRIENDLY_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[1-9][0-9]*");
@@ -38,6 +44,7 @@ public final class VestriDynamicServers {
     private final Logger logger;
     private final ConsoleBridgeProtocol consoleBridge = new ConsoleBridgeProtocol();
     private PlayerServers playerServers;
+    private PlayerManagement playerManagement;
     private static final MinecraftChannelIdentifier CONSOLE_CHANNEL = MinecraftChannelIdentifier.from(ConsoleBridgeProtocol.CHANNEL);
 
     @Inject
@@ -48,6 +55,13 @@ public final class VestriDynamicServers {
 
     @Subscribe
     public void initialize(ProxyInitializeEvent event) {
+        try {
+            playerManagement = new PlayerManagement(Path.of("."), logger);
+            proxy.getScheduler().buildTask(this, () -> playerManagement.sweep(proxy))
+                    .repeat(Duration.ofSeconds(5)).schedule();
+        } catch (IOException failure) {
+            logger.error("Player journal could not be loaded; new logins will be denied", failure);
+        }
         try {
             if (MinecraftInstanceClient.createDefaultConfiguration(Path.of("vestri-dynamic-config.json"))) {
                 logger.info("Created vestri-dynamic-config.json; set backendUrl to your frontend origin and add template API keys to enable lifecycle commands");
@@ -122,10 +136,62 @@ public final class VestriDynamicServers {
     @Subscribe
     public EventTask onServerConnected(ServerConnectedEvent event) {
         return EventTask.async(() -> {
+            if (playerManagement != null) {
+                playerManagement.connected(event.getPlayer());
+            }
             if (playerServers != null) {
                 playerServers.connected(event.getServer());
             }
         });
+    }
+
+    @Subscribe(order = PostOrder.LAST)
+    public EventTask onPreLogin(PreLoginEvent event) {
+        return EventTask.async(() -> {
+            if (playerManagement == null) {
+                event.setResult(PreLoginEvent.PreLoginComponentResult.denied(Component.text("Player management is unavailable. Please contact an administrator.")));
+            } else {
+                playerManagement.beforeLogin(event);
+            }
+        });
+    }
+
+    @Subscribe(order = PostOrder.LAST)
+    public EventTask onLogin(LoginEvent event) {
+        return EventTask.async(() -> {
+            if (playerManagement != null) {
+                playerManagement.login(event);
+            }
+        });
+    }
+
+    @Subscribe
+    public EventTask onDisconnect(DisconnectEvent event) {
+        return EventTask.async(() -> {
+            if (playerManagement != null) {
+                playerManagement.disconnected(event);
+            }
+        });
+    }
+
+    @Subscribe(order = PostOrder.LAST)
+    public EventTask onKick(KickedFromServerEvent event) {
+        return EventTask.async(() -> {
+            if (playerManagement != null) {
+                playerManagement.kicked(event);
+            }
+        });
+    }
+
+    @Subscribe
+    public void shutdown(ProxyShutdownEvent event) {
+        if (playerManagement != null) {
+            try {
+                playerManagement.shutdown();
+            } catch (IOException failure) {
+                logger.error("Could not save player journal during shutdown", failure);
+            }
+        }
     }
 
     @Subscribe

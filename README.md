@@ -4,6 +4,63 @@ This Java 17 plugin bridges Vestri's dynamic Minecraft instances into a running
 Velocity proxy. The same JAR includes an optional Paper/Spigot console bridge.
 Neither entry point provisions Docker containers itself.
 
+## Proxy Player Management (1.1.0)
+
+Deploy the 1.1.0 JAR to the Velocity proxy and restart the proxy. The panel's
+**Player Management** section replaces the former main-subserver whitelist UI.
+It requires server-management access and does not require a subserver to exist.
+No template API key or external HTTP endpoint is needed for this feature.
+
+The panel writes `vestri-player-policy.json` in the proxy working directory
+(`data/vestri-player-policy.json` from the worker/server-root perspective).
+The plugin checks IP bans at pre-login, then authenticated UUID bans and the
+optional UUID whitelist during login. Bans take precedence over the whitelist.
+It rereads policy on every login and every five seconds; active players who
+are no longer permitted are disconnected on the next sweep. Missing policy on
+first installation means whitelist disabled, with no bans. An invalid policy
+denies new logins until repaired, without mass-disconnecting existing players.
+Removing a previously loaded non-default policy also fails closed.
+
+For existing deployments, the panel offers to migrate the first configured
+subserver's enabled whitelist, retaining its UUID entries and enabled state.
+A fresh, healthy journal from the new plugin is required before migration.
+Saving first writes the proxy policy and then disables the old subserver
+whitelist in `server.properties`. **Restart that subserver once after migration**
+to apply the changed Minecraft setting. New subservers delegate whitelisting
+to the proxy from creation. Independent access rules on other backends remain
+independent. Deploy the updated plugin before creating such subservers.
+
+### Login Journal
+
+- `vestri-players.json` is an atomic snapshot refreshed every five seconds and
+  on orderly shutdown: up to 10,000 recently observed authenticated UUIDs and
+  the 1,000 most recently completed login events. Known players retain separate
+  last-successful-login time/IP and last-attempt time/IP across proxy restarts.
+- `vestri-player-logs/YYYY-MM-DD.jsonl` receives every completed event, including
+  failures, independently of the snapshot limit. Daily UTC archives are kept
+  for 30 calendar days and pruned automatically. They can be downloaded through
+  the existing server file browser. Monitor disk usage on busy/public proxies.
+- A successful login is recorded only after the first backend connection.
+  Pre-login denials, UUID/whitelist denials, early disconnects, and backend
+  connection rejections are recorded with their outcome and available reason.
+  A successful fallback after a rejected backend can generate a separate success.
+- When authentication closes the connection before a player object exists,
+  the five-second sweep records a failed attempt with the supplied username,
+  remote IP, start time, and a generic connection/authentication failure reason.
+  Pending attempts are also finalized on orderly shutdown, or after five minutes
+  without completion. A client-supplied pre-login UUID is never treated as an
+  authenticated identity; the UUID field stays absent until Velocity verifies it.
+- Packets rejected before Velocity exposes a username-bearing pre-login event
+  cannot supply a player identity to the plugin. Historical attempts from before
+  the update cannot be reconstructed. In offline mode, identity guarantees are
+  those of Velocity's configured authentication scheme.
+
+IP addresses are Velocity's remote addresses. If a load balancer is in front,
+configure trusted address forwarding at the proxy/network layer; do not expose
+trusted PROXY-protocol listeners directly to arbitrary clients. UUIDs and IPs
+are sensitive data: restrict server-file and management access, protect backups,
+and account for snapshot retention separately from the 30-day archive retention.
+
 ## Existing responsibilities
 
 - On proxy startup, read `vestri-dynamic-servers.json` if it exists.
