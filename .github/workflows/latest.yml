@@ -31,6 +31,8 @@ jobs:
         run: |
           set -euo pipefail
           name=$(mvn --quiet --batch-mode --no-transfer-progress help:evaluate -Dexpression=project.build.finalName -DforceStdout -Dstyle.color=never)
+          version=$(mvn --quiet --batch-mode --no-transfer-progress help:evaluate -Dexpression=project.version -DforceStdout -Dstyle.color=never)
+          printf 'PLUGIN_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
           artifact="target/${name}.jar"
           contents=$(jar tf "$artifact")
           for required in plugin.yml velocity-plugin.json net/kyori/adventure/platform/bukkit/BukkitAudiences.class; do
@@ -42,9 +44,8 @@ jobs:
               exit 1
             fi
           done
-          commit=$(git rev-parse HEAD)
           mkdir -p release
-          cp "$artifact" "release/${name}-${commit:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.jar"
+          cp "$artifact" "release/vestri-dynamic-servers-${version}.jar"
       - uses: actions/upload-artifact@v4
         with:
           name: vestri-dynamic-servers
@@ -56,6 +57,8 @@ jobs:
           script: |
             const fs = require('fs');
             const {owner, repo} = context.repo;
+            const version = process.env.PLUGIN_VERSION;
+            if (!version) throw new Error('Missing Maven plugin version');
             const sha = require('child_process').execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim();
             const branch = await github.rest.repos.getBranch({owner, repo, branch: 'main'});
             if (branch.data.commit.sha !== sha) {
@@ -71,16 +74,18 @@ jobs:
             } catch (error) {
               if (error.status !== 404) throw error;
               release = (await github.rest.repos.createRelease({owner, repo, tag_name: 'latest',
-                target_commitish: sha, name: 'Latest', draft: true, prerelease: false})).data;
+                target_commitish: sha, name: version, draft: true, prerelease: false})).data;
             }
             const assets = await github.paginate(github.rest.repos.listReleaseAssets,
               {owner, repo, release_id: release.id, per_page: 100});
             const data = fs.readFileSync(`release/${name}`);
             const existing = assets.find(asset => asset.name === name);
-            if (existing) {
-              const digest = 'sha256:' + require('crypto').createHash('sha256').update(data).digest('hex');
-              if (existing.digest !== digest) throw new Error('Existing commit asset has a different digest');
-            } else {
+            const digest = 'sha256:' + require('crypto').createHash('sha256').update(data).digest('hex');
+            const needsUpload = !existing || existing.digest !== digest;
+            if (existing && needsUpload) {
+              await github.rest.repos.deleteReleaseAsset({owner, repo, asset_id: existing.id});
+            }
+            if (needsUpload) {
               await github.rest.repos.uploadReleaseAsset({owner, repo, release_id: release.id,
                 name, data, headers: {'content-type': 'application/java-archive', 'content-length': data.length}});
             }
@@ -92,7 +97,7 @@ jobs:
               await github.rest.git.createRef({owner, repo, ref: 'refs/tags/latest', sha});
             }
             await github.rest.repos.updateRelease({owner, repo, release_id: release.id,
-              name: 'Latest', body: `Latest tested main build: ${sha}\n\nJava 17; one JAR for Paper/Spigot and Velocity.`,
+              name: version, body: `Latest tested main build: ${sha}\n\nJava 17; one JAR for Paper/Spigot and Velocity.`,
               draft: false, prerelease: false, make_latest: 'true'});
             for (const asset of assets) {
               if (asset.name.endsWith('.jar') && asset.name !== name) {

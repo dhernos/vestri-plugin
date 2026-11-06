@@ -15,8 +15,9 @@ GitHub Actions builds and tests `main` on pushes and manual dispatch, then
 uploads only the verified shaded JAR as a workflow artifact. Serialized publishing
 updates only the fixed `latest` tag/release, preserving versioned releases. A
 build superseded by a newer `main` commit skips publishing. The release asset
-uses the Maven artifact name plus commit and workflow-run suffixes; after uploading it, older JAR
-assets on `latest` are removed. The backend installer consumes
+is named `vestri-dynamic-servers-<version>.jar`, and the release title is the Maven
+version number. Rebuilding the same version replaces its asset if the contents
+changed; older JAR assets on `latest` are removed. The backend installer consumes
 `dhernos/vestri-plugin/releases/tags/latest` and accepts this dual-platform JAR.
 The repository must be hosted or mirrored on GitHub with Actions enabled; the
 local Gitea remote alone does not execute GitHub workflows.
