@@ -71,12 +71,12 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
         try {
             command = parse(invocation.arguments());
         } catch (IllegalArgumentException failure) {
-            invocation.source().sendMessage(Component.text(USAGE));
+            invocation.source().sendMessage(Component.text(USAGE, NamedTextColor.AQUA));
             return;
         }
         Player selected = command.sendPlayer() == null || transfer == null ? null : transfer.findPlayer(command.sendPlayer());
         if (command.sendPlayer() != null && selected == null) {
-            invocation.source().sendMessage(Component.text("Player is not connected to this proxy; no instance was spawned."));
+            invocation.source().sendMessage(Component.text("Player is not connected to this proxy; no instance was spawned.", NamedTextColor.AQUA));
             return;
         }
         if (command.action().equals("spawn")) {
@@ -106,26 +106,26 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                             yield "Server starting: " + (instance.name() == null ? command.template() : instance.name());
                         }
                         var instance = client.spawnWithTarget(command.template(), command.requestId());
-                        invocation.source().sendMessage(Component.text("Server starting: " + (instance.name() == null ? command.template() : instance.name())));
-                        transfer.start(selected, instance, message -> invocation.source().sendMessage(Component.text(message)));
+                        invocation.source().sendMessage(Component.text("Server starting: " + (instance.name() == null ? command.template() : instance.name()), NamedTextColor.AQUA));
+                        transfer.start(selected, instance, message -> invocation.source().sendMessage(Component.text(message, NamedTextColor.AQUA)));
                         yield null;
                     }
                     case "delete" -> "Instance deleted: " + client.delete(command.template(), command.instanceId());
                     default -> throw new IllegalArgumentException("Unknown command");
                 };
                 if (result != null) {
-                    invocation.source().sendMessage(Component.text(result));
+                    invocation.source().sendMessage(Component.text(result, NamedTextColor.AQUA));
                 }
             } catch (InterruptedException failure) {
                 Thread.currentThread().interrupt();
-                invocation.source().sendMessage(Component.text("Vestri request interrupted; check instance state before retrying."));
+                invocation.source().sendMessage(Component.text("Vestri request interrupted; check instance state before retrying.", NamedTextColor.AQUA));
             } catch (IOException failure) {
-                invocation.source().sendMessage(Component.text("Vestri command failed: " + failure.getMessage()));
+                invocation.source().sendMessage(Component.text("Vestri command failed: " + failure.getMessage(), NamedTextColor.AQUA));
                 if (selected != null && selected.isActive()) {
                         selected.sendMessage(PluginMessages.text("We couldn't finish preparing your server. Use /vestriservers list to retry or delete it by name, or contact a staff member.", NamedTextColor.RED));
                 }
             } catch (RuntimeException failure) {
-                invocation.source().sendMessage(Component.text("Vestri command failed: invalid configuration or API response."));
+                invocation.source().sendMessage(Component.text("Vestri command failed: invalid configuration or API response.", NamedTextColor.AQUA));
             }
         });
     }

@@ -12,9 +12,18 @@ public final class PluginMessages {
     }
 
     public static Component notice(Component content) {
-        return Component.text("Vestri", NamedTextColor.DARK_AQUA)
-            .append(Component.text(" > ", NamedTextColor.DARK_GRAY))
-            .append(content.replaceText(builder -> builder.match(IDENTIFIER).replacement("your server")));
+        return Component.text("Vestri", NamedTextColor.AQUA)
+            .append(Component.text(" > ", NamedTextColor.AQUA))
+            .append(blue(content.replaceText(builder -> builder.match(IDENTIFIER).replacement("your server"))));
+    }
+
+    private static Component blue(Component content) {
+        Component result = content.color(NamedTextColor.AQUA)
+                .children(content.children().stream().map(PluginMessages::blue).toList());
+        if (content.hoverEvent() != null && content.hoverEvent().value() instanceof Component hoverText) {
+            result = result.hoverEvent(net.kyori.adventure.text.event.HoverEvent.showText(blue(hoverText)));
+        }
+        return result;
     }
 
     public static Component text(String text, NamedTextColor color) {

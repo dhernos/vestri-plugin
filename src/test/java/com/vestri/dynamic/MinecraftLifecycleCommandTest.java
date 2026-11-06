@@ -129,7 +129,7 @@ class MinecraftLifecycleCommandTest {
         command.execute(invocation);
         assertEquals(0, scheduled.size());
         assertFalse(Files.exists(directory.resolve("absent.json")));
-        verify(console).sendMessage(Component.text("Player is not connected to this proxy; no instance was spawned."));
+        verify(console).sendMessage(Component.text("Player is not connected to this proxy; no instance was spawned.", net.kyori.adventure.text.format.NamedTextColor.AQUA));
     }
 
     @Test
@@ -181,7 +181,7 @@ class MinecraftLifecycleCommandTest {
             assertEquals(List.of("POST"), calls);
             verify(target).ping();
             assertEquals(1, polls.size());
-            verify(console).sendMessage(Component.text("Server starting: Bed Wars"));
+            verify(console).sendMessage(Component.text("Server starting: Bed Wars", net.kyori.adventure.text.format.NamedTextColor.AQUA));
         } finally {
             server.stop(0);
         }
@@ -202,7 +202,7 @@ class MinecraftLifecycleCommandTest {
         command.execute(invocation);
         scheduled.get(0).run();
 
-        verify(console).sendMessage(Component.text("Configured templates: bed wars"));
+        verify(console).sendMessage(Component.text("Configured templates: bed wars", net.kyori.adventure.text.format.NamedTextColor.AQUA));
         when(invocation.arguments()).thenReturn(new String[]{"delete", "Bed Wars"});
         command.execute(invocation);
         assertEquals(1, scheduled.size());

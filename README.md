@@ -22,11 +22,35 @@ changed; older JAR assets on `latest` are removed. The backend installer consume
 The repository must be hosted or mirrored on GitHub with Actions enabled; the
 local Gitea remote alone does not execute GitHub workflows.
 
-Player chat and access denials share an Adventure `Vestri > ` prefix, with gray
-separators and semantic status colors. Existing language and literal text are
+Player chat and access denials share an Adventure `Vestri > ` prefix, with uniform
+aqua-blue text, including nested text and join tooltips. Existing language and literal text are
 preserved, including interactive join components. UUIDs and internal `mcgame-`
 names/addresses are hidden from player text; console diagnostics retain their
 operator details. Paper/Spigot uses the bundled Bukkit Adventure audience adapter.
+
+## Plugin Data Folder
+
+Velocity stores all plugin configuration and state in `plugins/vestri-dynamic/`:
+
+```text
+plugins/vestri-dynamic/
+  vestri-dynamic-config.json
+  vestri-dynamic-servers.json
+  vestri-player-servers.json
+  vestri-player-policy.json
+  vestri-players.json
+  vestri-player-logs/
+```
+
+Existing files beside `velocity.toml` move automatically on the first startup
+with this plugin version. Configuration, ownership, policy, journals, and log
+archives are preserved. If both locations contain the same file name, startup
+fails closed rather than overwriting either copy; resolve the conflict while
+the proxy is stopped. Back up the whole plugin folder on persistent storage.
+Deploy the updated Vestri backend before restarting the upgraded proxy so panel
+file access follows the new location; older plugins retain legacy-path support.
+Paper/Spigot already keeps its bridge configuration in
+`plugins/VestriConsoleBridge/config.yml`.
 
 ## Proxy Player Management (1.1.0)
 
@@ -35,8 +59,8 @@ Deploy the 1.1.0 JAR to the Velocity proxy and restart the proxy. The panel's
 It requires server-management access and does not require a subserver to exist.
 No template API key or external HTTP endpoint is needed for this feature.
 
-The panel writes `vestri-player-policy.json` in the proxy working directory
-(`data/vestri-player-policy.json` from the worker/server-root perspective).
+The panel writes `vestri-player-policy.json` in `plugins/vestri-dynamic/`
+(`data/plugins/vestri-dynamic/vestri-player-policy.json` from the worker/server-root perspective).
 The plugin checks IP bans at pre-login, then authenticated UUID bans and the
 optional UUID whitelist during login. Bans take precedence over the whitelist.
 It rereads policy on every login and every five seconds; active players who
@@ -291,7 +315,7 @@ another server. A request UUID cannot be reused for another owner, template, or
 lifecycle type.
 
 The proxy persists ownership, request UUIDs, pause flags, power state, and deletion deadlines in
-`vestri-player-servers.json` in its working directory using atomic replacement.
+`plugins/vestri-dynamic/vestri-player-servers.json` using atomic replacement.
 Keep this file on persistent storage and back it up. An invalid registry fails
 closed for player management instead of losing ownership or deleting unknown
 servers. Never edit or remove it while the proxy is running. Original template
@@ -368,8 +392,8 @@ to this Velocity proxy. Create a Minecraft API key scoped to that template. Repe
 for each template the console should manage. These are saved templates with server
 files, not the built-in software choices such as `minecraft-vanilla`.
 
-On startup, the plugin creates `vestri-dynamic-config.json` in Velocity's working
-directory, beside `velocity.toml` and `vestri-dynamic-servers.json`, if it is
+On startup, the plugin creates `vestri-dynamic-config.json` in
+`plugins/vestri-dynamic/`, beside `vestri-dynamic-servers.json`, if it is
 missing. Existing files are never overwritten. The generated file has an empty
 `templates` object and a random bridge secret with an empty backend allowlist;
 commands remain unconfigured until you fill in the URL and template keys. On

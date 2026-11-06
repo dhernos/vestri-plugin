@@ -10,12 +10,24 @@ import org.junit.jupiter.api.Test;
 
 class PluginMessagesTest {
     @Test
-    void preservesLiteralLanguageAndColors() {
+    void preservesLiteralLanguageAndUsesBlueForAllMessageParts() {
         String text = "Dein Server ist bereit. <red>Survival-1</red>";
         Component message = PluginMessages.text(text, NamedTextColor.GREEN);
         assertEquals("Vestri > " + text, PlainTextComponentSerializer.plainText().serialize(message));
-        assertEquals(NamedTextColor.DARK_AQUA, message.color());
-        assertEquals(NamedTextColor.GREEN, message.children().get(1).color());
+        assertEquals(NamedTextColor.AQUA, message.color());
+        assertEquals(NamedTextColor.AQUA, message.children().get(0).color());
+        assertEquals(NamedTextColor.AQUA, message.children().get(1).color());
+    }
+
+    @Test
+    void overridesNestedStatusColors() {
+        Component content = Component.text("Status", NamedTextColor.RED)
+                .append(Component.text(" ready", NamedTextColor.GREEN)
+                        .append(Component.text("!", NamedTextColor.WHITE)));
+        Component formatted = PluginMessages.notice(content).children().get(1);
+        assertEquals(NamedTextColor.AQUA, formatted.color());
+        assertEquals(NamedTextColor.AQUA, formatted.children().get(0).color());
+        assertEquals(NamedTextColor.AQUA, formatted.children().get(0).children().get(0).color());
     }
 
     @Test
@@ -39,6 +51,9 @@ class PluginMessagesTest {
         Component join = Component.text("Join", NamedTextColor.GREEN)
                 .clickEvent(ClickEvent.runCommand("/vestriservers join Survival-1"))
                 .hoverEvent(HoverEvent.showText(Component.text("Join Survival-1")));
-        assertEquals(join, PluginMessages.notice(join).children().get(1));
+        Component formatted = PluginMessages.notice(join).children().get(1);
+        assertEquals(join.clickEvent(), formatted.clickEvent());
+        assertEquals(NamedTextColor.AQUA, formatted.color());
+        assertEquals(HoverEvent.showText(Component.text("Join Survival-1", NamedTextColor.AQUA)), formatted.hoverEvent());
     }
 }

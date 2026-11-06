@@ -314,7 +314,6 @@ final class PlayerServers implements SimpleCommand {
         entry.preparationDeleteAfter = 0;
         entry.joinUntil = clock.getAsLong() + JOIN_WINDOW;
         registry.save();
-        message(player, serverName(entry) + " is starting. Your connection will begin shortly.");
         transfer.start(player, instance, logger::info);
     }
 

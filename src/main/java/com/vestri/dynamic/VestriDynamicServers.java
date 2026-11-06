@@ -18,6 +18,7 @@ import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
+import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.ConsoleCommandSource;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
@@ -42,39 +43,51 @@ public final class VestriDynamicServers {
     private static final Pattern FRIENDLY_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[1-9][0-9]*");
     private final ProxyServer proxy;
     private final Logger logger;
+    private final Path dataDirectory;
     private final ConsoleBridgeProtocol consoleBridge = new ConsoleBridgeProtocol();
     private PlayerServers playerServers;
     private PlayerManagement playerManagement;
     private static final MinecraftChannelIdentifier CONSOLE_CHANNEL = MinecraftChannelIdentifier.from(ConsoleBridgeProtocol.CHANNEL);
 
-    @Inject
     public VestriDynamicServers(ProxyServer proxy, Logger logger) {
+        this(proxy, logger, Path.of("plugins", "vestri-dynamic"));
+    }
+
+    @Inject
+    public VestriDynamicServers(ProxyServer proxy, Logger logger, @DataDirectory Path dataDirectory) {
         this.proxy = proxy;
         this.logger = logger;
+        this.dataDirectory = dataDirectory;
     }
 
     @Subscribe
     public void initialize(ProxyInitializeEvent event) {
         try {
-            playerManagement = new PlayerManagement(Path.of("."), logger);
+            PluginDataDirectory.prepare(Path.of("."), dataDirectory);
+        } catch (IOException failure) {
+            logger.error("Plugin data migration failed; resolve file conflicts or permissions before restarting", failure);
+            return;
+        }
+        try {
+            playerManagement = new PlayerManagement(dataDirectory, logger);
             proxy.getScheduler().buildTask(this, () -> playerManagement.sweep(proxy))
                     .repeat(Duration.ofSeconds(5)).schedule();
         } catch (IOException failure) {
             logger.error("Player journal could not be loaded; new logins will be denied", failure);
         }
         try {
-            if (MinecraftInstanceClient.createDefaultConfiguration(Path.of("vestri-dynamic-config.json"))) {
-                logger.info("Created vestri-dynamic-config.json; set backendUrl to your frontend origin and add template API keys to enable lifecycle commands");
+            if (MinecraftInstanceClient.createDefaultConfiguration(dataDirectory.resolve("vestri-dynamic-config.json"))) {
+                logger.info("Created {}; set backendUrl to your frontend origin and add template API keys to enable lifecycle commands", dataDirectory.resolve("vestri-dynamic-config.json"));
             }
         } catch (IOException failure) {
-            logger.error("Could not create vestri-dynamic-config.json; check working-directory permissions");
+            logger.error("Could not create plugin configuration; check plugin-folder permissions");
         }
         proxy.getChannelRegistrar().register(CONSOLE_CHANNEL);
         SpawnPlayerTransfer playerTransfer = new SpawnPlayerTransfer(proxy,
                 (task, delay) -> proxy.getScheduler().buildTask(this, task).delay(delay).schedule());
         try {
-            playerServers = new PlayerServers(proxy, Path.of("vestri-dynamic-config.json"),
-                    new OwnedServerRegistry(Path.of("vestri-player-servers.json")), playerTransfer,
+                playerServers = new PlayerServers(proxy, dataDirectory.resolve("vestri-dynamic-config.json"),
+                    new OwnedServerRegistry(dataDirectory.resolve("vestri-player-servers.json")), playerTransfer,
                     task -> proxy.getScheduler().buildTask(this, task).schedule(), logger);
             proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("vestriservers").plugin(this).build(), playerServers);
             proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("vestripause").plugin(this).build(), playerServers.pauseCommand());
@@ -84,7 +97,7 @@ public final class VestriDynamicServers {
             logger.error("Player server management disabled: {}", failure.getMessage());
         }
         MinecraftLifecycleCommand lifecycle = new MinecraftLifecycleCommand(
-            task -> proxy.getScheduler().buildTask(this, task).schedule(), Path.of("vestri-dynamic-config.json"),
+            task -> proxy.getScheduler().buildTask(this, task).schedule(), dataDirectory.resolve("vestri-dynamic-config.json"),
             playerTransfer, playerServers);
         proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("vestridynamic").plugin(this).build(), new SimpleCommand() {
             @Override
@@ -107,7 +120,7 @@ public final class VestriDynamicServers {
                     return;
                 }
                 try {
-                    synchronizeServers(Path.of("vestri-dynamic-servers.json"));
+                    synchronizeServers(dataDirectory.resolve("vestri-dynamic-servers.json"));
                     invocation.source().sendMessage(Component.text("VESTRI_DYNAMIC_SYNC_OK"));
                 } catch (Exception failure) {
                     logger.error("Dynamic server synchronization failed", failure);
@@ -115,9 +128,9 @@ public final class VestriDynamicServers {
                 }
             }
         });
-        if (Files.exists(Path.of("vestri-dynamic-servers.json"))) {
+        if (Files.exists(dataDirectory.resolve("vestri-dynamic-servers.json"))) {
             try {
-                synchronizeServers(Path.of("vestri-dynamic-servers.json"));
+                synchronizeServers(dataDirectory.resolve("vestri-dynamic-servers.json"));
             } catch (Exception failure) {
                 logger.error("Initial dynamic server synchronization failed", failure);
             }
@@ -196,7 +209,7 @@ public final class VestriDynamicServers {
 
     @Subscribe
     public void onPluginMessage(PluginMessageEvent event) {
-        forwardConsoleCommand(event, Path.of("vestri-dynamic-config.json"));
+        forwardConsoleCommand(event, dataDirectory.resolve("vestri-dynamic-config.json"));
     }
 
     void forwardConsoleCommand(PluginMessageEvent event, Path configPath) {

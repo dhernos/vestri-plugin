@@ -127,6 +127,18 @@ class PlayerServersTest {
     }
 
     @Test
+    void spawnSendsOnlyOneBlueStartingAnnouncement() {
+        service.execute(invocation("spawn", "temporary", "Survival"));
+        var captured = ArgumentCaptor.forClass(Component.class);
+        verify(player, atLeastOnce()).sendMessage(captured.capture());
+        var announcements = captured.getAllValues().stream()
+                .filter(component -> text(component).contains(" is starting.")).toList();
+        assertEquals(1, announcements.size());
+        assertTrue(text(announcements.get(0)).contains("We'll connect you when it's ready."));
+        assertEquals(net.kyori.adventure.text.format.NamedTextColor.AQUA, announcements.get(0).color());
+    }
+
+    @Test
     void temporaryDeletesOnlyWhenEmptyAndPermanentIsPreserved() throws Exception {
         var temporary = entry(OwnedServerRegistry.Type.TEMPORARY);
         when(target.getPlayersConnected()).thenReturn(List.of(player));
