@@ -14,6 +14,8 @@ import com.velocitypowered.api.proxy.ProxyServer;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 import net.kyori.adventure.text.Component;
@@ -161,7 +163,7 @@ class PlayerManagementTest {
     }
 
     @Test
-    void boundedDashboardDoesNotTruncateDailyAuditLog() throws Exception {
+    void journalAndDailyArchivesKeepNewestThousandEventsAcrossRestart() throws Exception {
         policy(false, "[]", "[]", "[\"203.0.113.8\"]");
         PlayerManagement management = management();
         InboundConnection connection = connection(true);
@@ -172,9 +174,89 @@ class PlayerManagementTest {
         assertEquals(1000, journal().getAsJsonArray("attempts").size());
         try (var files = Files.list(directory.resolve("vestri-player-logs"))) {
             try (var lines = Files.lines(files.findFirst().orElseThrow())) {
-                assertEquals(1005, lines.count());
+                List<String> retained = lines.toList();
+                assertEquals(1000, retained.size());
+                var attempts = journal().getAsJsonArray("attempts");
+                assertEquals(attempts.get(999), JsonParser.parseString(retained.get(0)));
+                assertEquals(attempts.get(0), JsonParser.parseString(retained.get(999)));
             }
         }
+        PlayerManagement restored = management();
+        restored.beforeLogin(new PreLoginEvent(connection, "Notch"));
+        restored.flush();
+        Path archive = directory.resolve("vestri-player-logs").resolve(LocalDate.now(ZoneOffset.UTC) + ".jsonl");
+        List<String> retained = Files.readAllLines(archive);
+        assertEquals(1000, retained.size());
+        assertEquals(journal().getAsJsonArray("attempts").get(999), JsonParser.parseString(retained.get(0)));
+        assertEquals(journal().getAsJsonArray("attempts").get(0), JsonParser.parseString(retained.get(999)));
+    }
+
+    @Test
+    void startupPrunesLegacyArchivesByCountAndAgeWithoutTouchingOtherFiles() throws Exception {
+        Path logs = Files.createDirectories(directory.resolve("vestri-player-logs"));
+        LocalDate today = LocalDate.now(ZoneOffset.UTC);
+        Path expired = logs.resolve(today.minusDays(30) + ".jsonl");
+        Path oldest = logs.resolve(today.minusDays(29) + ".jsonl");
+        Path boundary = logs.resolve(today.minusDays(1) + ".jsonl");
+        Path newest = logs.resolve(today + ".jsonl");
+        Files.writeString(expired, "{\"id\":\"expired\"}\n");
+        Files.writeString(oldest, "{\"id\":\"oldest\"}\n".repeat(200));
+        StringBuilder legacy = new StringBuilder();
+        for (int event = 0; event < 1500; event++) {
+            legacy.append("{\"id\":").append(event).append("}\n");
+        }
+        Files.writeString(boundary, legacy);
+        var permissions = java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----");
+        Files.setPosixFilePermissions(boundary, permissions);
+        Files.writeString(newest, "{\"id\":\"newest\"}\n".repeat(200));
+        Path unrelated = logs.resolve("operator-backup.jsonl");
+        Files.writeString(unrelated, "keep");
+        Path invalidDate = logs.resolve("2026-99-99.jsonl");
+        Files.writeString(invalidDate, "keep");
+        Path external = directory.resolve("external.jsonl");
+        Files.writeString(external, "keep");
+        Path linked = logs.resolve(today.minusDays(2) + ".jsonl");
+        Files.createSymbolicLink(linked, external);
+
+        management();
+        assertFalse(Files.exists(expired));
+        assertFalse(Files.exists(oldest));
+        List<String> retained = Files.readAllLines(boundary);
+        assertEquals(800, retained.size());
+        assertEquals("{\"id\":700}", retained.get(0));
+        assertEquals("{\"id\":1499}", retained.get(799));
+        assertEquals(permissions, Files.getPosixFilePermissions(boundary));
+        assertEquals(200, Files.readAllLines(newest).size());
+        assertEquals("keep", Files.readString(unrelated));
+        assertEquals("keep", Files.readString(invalidDate));
+        assertTrue(Files.isSymbolicLink(linked));
+        assertEquals("keep", Files.readString(external));
+        management();
+        assertEquals(retained, Files.readAllLines(boundary));
+        try (var files = Files.list(logs)) {
+            assertFalse(files.anyMatch(file -> file.getFileName().toString().endsWith(".tmp")));
+        }
+    }
+
+    @Test
+    void exactLimitKeepsDayTwentyNineUntilNextEventDeletesOldestFile() throws Exception {
+        Path logs = Files.createDirectories(directory.resolve("vestri-player-logs"));
+        LocalDate today = LocalDate.now(ZoneOffset.UTC);
+        Path oldest = logs.resolve(today.minusDays(29) + ".jsonl");
+        Path newest = logs.resolve(today + ".jsonl");
+        Files.writeString(oldest, "{\"id\":\"oldest\"}\n");
+        Files.writeString(newest, "{\"id\":\"recent\"}\n".repeat(999));
+        policy(false, "[]", "[]", "[\"203.0.113.8\"]");
+        PlayerManagement management = management();
+        assertTrue(Files.exists(oldest));
+        assertEquals(999, Files.readAllLines(newest).size());
+        management.beforeLogin(new PreLoginEvent(connection(true), "Notch"));
+        management.flush();
+        assertFalse(Files.exists(oldest));
+        List<String> retained = Files.readAllLines(newest);
+        assertEquals(1000, retained.size());
+        assertEquals("{\"id\":\"recent\"}", retained.get(0));
+        assertEquals(journal().getAsJsonArray("attempts").get(0), JsonParser.parseString(retained.get(999)));
     }
 
     @Test

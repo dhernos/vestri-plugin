@@ -122,8 +122,7 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
             } catch (IOException failure) {
                 invocation.source().sendMessage(Component.text("Vestri command failed: " + failure.getMessage()));
                 if (selected != null && selected.isActive()) {
-                    selected.sendMessage(Component.text("Vestri > ", NamedTextColor.DARK_AQUA)
-                            .append(Component.text("We couldn't finish preparing your server. Use /vestriservers list to retry or delete it by name, or contact a staff member.", NamedTextColor.RED)));
+                        selected.sendMessage(PluginMessages.text("We couldn't finish preparing your server. Use /vestriservers list to retry or delete it by name, or contact a staff member.", NamedTextColor.RED));
                 }
             } catch (RuntimeException failure) {
                 invocation.source().sendMessage(Component.text("Vestri command failed: invalid configuration or API response."));

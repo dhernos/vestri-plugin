@@ -2,19 +2,33 @@ package com.vestri.dynamic.bukkit;
 
 import com.vestri.dynamic.ConsoleBridgeProtocol;
 import com.vestri.dynamic.LifecycleSuggestions;
+import com.vestri.dynamic.PluginMessages;
 import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
+import net.kyori.adventure.platform.bukkit.BukkitAudiences;
+import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class VestriConsoleBridge extends JavaPlugin {
+    private BukkitAudiences audiences;
+
     @Override
     public void onEnable() {
+        audiences = BukkitAudiences.create(this);
         saveDefaultConfig();
         getServer().getMessenger().registerOutgoingPluginChannel(this, ConsoleBridgeProtocol.CHANNEL);
+    }
+
+    @Override
+    public void onDisable() {
+        if (audiences != null) {
+            audiences.close();
+            audiences = null;
+        }
     }
 
     @Override
@@ -29,7 +43,7 @@ public final class VestriConsoleBridge extends JavaPlugin {
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] arguments) {
         if (!(sender instanceof ConsoleCommandSender)) {
-            sender.sendMessage("This command is console-only.");
+            audiences.sender(sender).sendMessage(PluginMessages.text("This command is console-only.", NamedTextColor.RED));
             return true;
         }
         var carrier = getServer().getOnlinePlayers().stream().findFirst();

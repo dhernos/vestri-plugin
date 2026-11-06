@@ -128,11 +128,31 @@ class SpawnPlayerTransferTest {
         var texts = chat.getAllValues().stream().map(PlainTextComponentSerializer.plainText()::serialize).toList();
         assertEquals(List.of("Your server is starting. We'll connect you when it's ready.",
             "Teleporting in 5...", "Teleporting in 4...", "Teleporting in 3...",
-            "Teleporting in 2...", "Teleporting in 1...", "Connected to BedWars-2."), texts);
+            "Teleporting in 2...", "Teleporting in 1...", "Connected to BedWars-2.").stream()
+                .map(text -> "Vestri > " + text).toList(), texts);
         assertEquals(List.of(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1),
             Duration.ofSeconds(1), Duration.ofSeconds(1)), delays.subList(delays.size() - 5, delays.size()));
         assertTrue(texts.stream().noneMatch(text -> text.contains(instance.serverId()) || text.contains(instance.slug())));
         assertTrue(messages.stream().allMatch(text -> text.contains(instance.serverId())));
+    }
+
+    @Test
+    void hidesLegacyRegisteredIdentifiersFromPlayersButKeepsConsoleDiagnostics() {
+        when(target.getServerInfo()).thenReturn(new ServerInfo(instance.slug(),
+                InetSocketAddress.createUnresolved("vestri-" + instance.slug(), 25565)));
+        when(target.ping()).thenReturn(CompletableFuture.completedFuture(readyPing()));
+        var connection = prepareConnection();
+        transfer.start(player, instance, messages::add);
+        finishWarmup();
+        var result = mock(ConnectionRequestBuilder.Result.class);
+        when(result.isSuccessful()).thenReturn(true);
+        connection.complete(result);
+        var chat = ArgumentCaptor.forClass(Component.class);
+        verify(player, times(7)).sendMessage(chat.capture());
+        var texts = chat.getAllValues().stream().map(PlainTextComponentSerializer.plainText()::serialize).toList();
+        assertEquals("Vestri > Connected to your server.", texts.get(texts.size() - 1));
+        assertTrue(texts.stream().noneMatch(text -> text.contains(instance.serverId()) || text.contains(instance.slug())));
+        assertTrue(messages.get(messages.size() - 1).contains(instance.slug()));
     }
 
     @Test
@@ -244,7 +264,7 @@ class SpawnPlayerTransferTest {
         scheduled.remove(0).run();
         beginCountdown();
         verify(player, never()).createConnectionRequest(any());
-        verify(player, times(2)).sendMessage(Component.text("Teleporting in 5...", net.kyori.adventure.text.format.NamedTextColor.AQUA));
+        verify(player, times(2)).sendMessage(PluginMessages.text("Teleporting in 5...", net.kyori.adventure.text.format.NamedTextColor.AQUA));
         finishCountdown();
         verify(player).createConnectionRequest(target);
     }

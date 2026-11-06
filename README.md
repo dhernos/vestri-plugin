@@ -4,6 +4,29 @@ This Java 17 plugin bridges Vestri's dynamic Minecraft instances into a running
 Velocity proxy. The same JAR includes an optional Paper/Spigot console bridge.
 Neither entry point provisions Docker containers itself.
 
+## Builds and Latest Release
+
+Build with Java 17 and `mvn clean package`. The installable shaded artifact is
+`target/vestri-dynamic-servers-1.1.0.jar`, not `target/original-*.jar`. It includes
+both `plugin.yml` and `velocity-plugin.json`, plus the Bukkit Adventure adapter.
+Server APIs remain provided by Paper/Spigot or Velocity.
+
+GitHub Actions builds and tests `main` on pushes and manual dispatch, then
+uploads only the verified shaded JAR as a workflow artifact. Serialized publishing
+updates only the fixed `latest` tag/release, preserving versioned releases. A
+build superseded by a newer `main` commit skips publishing. The release asset
+uses the Maven artifact name plus commit and workflow-run suffixes; after uploading it, older JAR
+assets on `latest` are removed. The backend installer consumes
+`dhernos/vestri-plugin/releases/tags/latest` and accepts this dual-platform JAR.
+The repository must be hosted or mirrored on GitHub with Actions enabled; the
+local Gitea remote alone does not execute GitHub workflows.
+
+Player chat and access denials share an Adventure `Vestri > ` prefix, with gray
+separators and semantic status colors. Existing language and literal text are
+preserved, including interactive join components. UUIDs and internal `mcgame-`
+names/addresses are hidden from player text; console diagnostics retain their
+operator details. Paper/Spigot uses the bundled Bukkit Adventure audience adapter.
+
 ## Proxy Player Management (1.1.0)
 
 Deploy the 1.1.0 JAR to the Velocity proxy and restart the proxy. The panel's
@@ -37,9 +60,17 @@ independent. Deploy the updated plugin before creating such subservers.
   the 1,000 most recently completed login events. Known players retain separate
   last-successful-login time/IP and last-attempt time/IP across proxy restarts.
 - `vestri-player-logs/YYYY-MM-DD.jsonl` receives every completed event, including
-  failures, independently of the snapshot limit. Daily UTC archives are kept
-  for 30 calendar days and pruned automatically. They can be downloaded through
-  the existing server file browser. Monitor disk usage on busy/public proxies.
+  failures. Across all daily UTC files, each proxy retains at most 1,000 events:
+  event 1,001 removes the oldest event, not all events for that player. Files
+  older than today minus 29 days are also deleted (30 calendar days inclusive).
+  Both limits apply at startup and before/after appends; age cleanup also runs
+  on the five-second sweep. Archives can be downloaded in the server file browser.
+  Startup streams existing archives to count lines, including legacy oversized
+  files. Counts are cached during the day; retention deletes whole oldest files
+  and atomically replaces only the boundary file with its retained newest lines.
+  After startup that file has at most 1,001 lines, so appends never rescan huge
+  historical archives. This directory is plugin-owned: do not edit dated files
+  while the proxy runs. Unrelated files and symbolic links are not pruned.
 - A successful login is recorded only after the first backend connection.
   Pre-login denials, UUID/whitelist denials, early disconnects, and backend
   connection rejections are recorded with their outcome and available reason.
@@ -59,7 +90,9 @@ IP addresses are Velocity's remote addresses. If a load balancer is in front,
 configure trusted address forwarding at the proxy/network layer; do not expose
 trusted PROXY-protocol listeners directly to arbitrary clients. UUIDs and IPs
 are sensitive data: restrict server-file and management access, protect backups,
-and account for snapshot retention separately from the 30-day archive retention.
+and account for snapshot retention separately from the archive's combined
+1,000-event/30-day retention. Operational logs and operator-created backups are
+not covered by player-event retention and require their own retention policy.
 
 ## Existing responsibilities
 

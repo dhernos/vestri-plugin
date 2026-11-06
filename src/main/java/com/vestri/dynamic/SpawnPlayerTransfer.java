@@ -129,7 +129,7 @@ final class SpawnPlayerTransfer {
                                 return;
                             }
                             if (countdown > 0) {
-                                player.sendMessage(Component.text("Teleporting in " + countdown + "...", NamedTextColor.AQUA));
+                                player.sendMessage(PluginMessages.text("Teleporting in " + countdown + "...", NamedTextColor.AQUA));
                                 countdown--;
                                 retry();
                                 return;
@@ -178,7 +178,8 @@ final class SpawnPlayerTransfer {
                                     Component.text("We couldn't connect you to your server. Please contact a staff member.", NamedTextColor.RED));
                             } else {
                                 finish("Connected " + player.getUsername() + " to " + target.getServerInfo().getName() + ".",
-                                    Component.text("Connected to " + target.getServerInfo().getName() + ".", NamedTextColor.GREEN));
+                                    Component.text("Connected to " + PluginMessages.safeText(instance.name() == null
+                                            ? target.getServerInfo().getName() : instance.name()) + ".", NamedTextColor.GREEN));
                             }
                         });
             } catch (RuntimeException failure) {
@@ -205,7 +206,7 @@ final class SpawnPlayerTransfer {
             String text = "Instance " + instance.serverId() + ": " + message;
             output.accept(text);
             if (playerMessage != null && active()) {
-                player.sendMessage(playerMessage);
+                player.sendMessage(PluginMessages.notice(playerMessage));
             }
         }
 

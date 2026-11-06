@@ -16,17 +16,21 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFileAttributeView;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
-import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.slf4j.Logger;
 
@@ -39,6 +43,7 @@ final class PlayerManagement {
     private final Map<InetSocketAddress, PendingLogin> pending = new LinkedHashMap<>();
     private final Map<String, JsonObject> players = new LinkedHashMap<>();
     private final ArrayDeque<JsonObject> attempts = new ArrayDeque<>();
+    private final Map<Path, Long> archiveCounts = new TreeMap<>();
     private JsonObject policy = defaultPolicy();
     private boolean policyHealthy = true;
     private String policyError;
@@ -67,6 +72,7 @@ final class PlayerManagement {
             }
         }
         reloadPolicy();
+        pruneArchives();
     }
 
     private static JsonObject defaultPolicy() {
@@ -167,7 +173,7 @@ final class PlayerManagement {
         PendingLogin login = new PendingLogin(connection, event.getUsername());
         String denied = denial(null, login.ip());
         if (denied != null) {
-            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(Component.text(denied)));
+            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(PluginMessages.text(denied, NamedTextColor.RED)));
         }
         if (!event.getResult().isAllowed()) {
             record(login, "denied", event.getResult().getReasonComponent()
@@ -175,7 +181,7 @@ final class PlayerManagement {
             return;
         }
         if (pending.size() >= MAX_PLAYERS) {
-            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(Component.text("Too many pending logins. Please retry.")));
+            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(PluginMessages.text("Too many pending logins. Please retry.", NamedTextColor.RED)));
             record(login, "denied", "Pending login limit reached");
             return;
         }
@@ -190,7 +196,7 @@ final class PlayerManagement {
         login.name = player.getUsername();
         String denied = denial(login.uuid, login.ip());
         if (denied != null) {
-            event.setResult(ComponentResult.denied(Component.text(denied)));
+            event.setResult(ComponentResult.denied(PluginMessages.text(denied, NamedTextColor.RED)));
         }
         if (!event.getResult().isAllowed()) {
             pending.remove(player.getRemoteAddress());
@@ -250,7 +256,7 @@ final class PlayerManagement {
             for (Player player : proxy.getAllPlayers()) {
                 String denied = denial(player.getUniqueId(), player.getRemoteAddress().getAddress().getHostAddress());
                 if (denied != null) {
-                    player.disconnect(Component.text(denied));
+                    player.disconnect(PluginMessages.text(denied, NamedTextColor.RED));
                 }
             }
         }
@@ -258,6 +264,7 @@ final class PlayerManagement {
             flush();
             pruneArchives();
         } catch (IOException failure) {
+            lastPruned = null;
             logger.error("Could not persist player journal", failure);
         }
     }
@@ -298,9 +305,18 @@ final class PlayerManagement {
         try {
             Path logs = directory.resolve("vestri-player-logs");
             Files.createDirectories(logs);
-            Files.writeString(logs.resolve(LocalDate.now(ZoneOffset.UTC) + ".jsonl"), JSON.toJson(attempt) + "\n",
+            pruneArchives();
+            Path archive = logs.resolve(LocalDate.now(ZoneOffset.UTC) + ".jsonl");
+            if (Files.exists(archive, LinkOption.NOFOLLOW_LINKS)
+                    && !Files.isRegularFile(archive, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Player archive is not a regular file: " + archive);
+            }
+            Files.writeString(archive, JSON.toJson(attempt) + "\n",
                     StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            archiveCounts.merge(archive, 1L, Long::sum);
+            pruneArchives();
         } catch (IOException failure) {
+            lastPruned = null;
             logger.error("Could not append player login audit event {}", attempt.get("id"), failure);
         }
     }
@@ -344,22 +360,86 @@ final class PlayerManagement {
 
     private void pruneArchives() throws IOException {
         LocalDate today = LocalDate.now(ZoneOffset.UTC);
-        if (today.equals(lastPruned)) {
-            return;
-        }
         Path logs = directory.resolve("vestri-player-logs");
-        if (Files.isDirectory(logs)) {
+        if (Files.isSymbolicLink(logs)) {
+            throw new IOException("Player archive directory must not be a symbolic link");
+        }
+        if (!today.equals(lastPruned) && Files.isDirectory(logs)) {
+            archiveCounts.clear();
             try (var files = Files.list(logs)) {
-                for (Path file : files.toList()) {
+                for (Path file : files.sorted().toList()) {
                     String name = file.getFileName().toString();
-                    if (name.matches("\\d{4}-\\d{2}-\\d{2}\\.jsonl")
-                            && LocalDate.parse(name.substring(0, 10)).isBefore(today.minusDays(29))) {
+                    if (!name.matches("\\d{4}-\\d{2}-\\d{2}\\.jsonl")
+                            || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+                        continue;
+                    }
+                    LocalDate date;
+                    try {
+                        date = LocalDate.parse(name.substring(0, 10));
+                    } catch (DateTimeParseException invalidDate) {
+                        continue;
+                    }
+                    if (date.isBefore(today.minusDays(29))) {
                         Files.delete(file);
+                    } else {
+                        try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                            long count = 0;
+                            while (reader.readLine() != null) {
+                                count++;
+                            }
+                            archiveCounts.put(file, count);
+                        }
                     }
                 }
             }
         }
+        long excess = archiveCounts.values().stream().mapToLong(Long::longValue).sum() - MAX_ATTEMPTS;
+        var oldest = archiveCounts.entrySet().iterator();
+        while (excess > 0 && oldest.hasNext()) {
+            var entry = oldest.next();
+            Path file = entry.getKey();
+            long count = entry.getValue();
+            if (count <= excess) {
+                Files.delete(file);
+                oldest.remove();
+                excess -= count;
+            } else {
+                retainArchiveTail(file, count, count - excess);
+                entry.setValue(count - excess);
+                excess = 0;
+            }
+        }
         lastPruned = today;
+    }
+
+    private void retainArchiveTail(Path file, long count, long retain) throws IOException {
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Player archive is not a regular file: " + file);
+        }
+        Path temporary = Files.createTempFile(file.getParent(), ".vestri-player-archive-", ".tmp");
+        try {
+            long seen = 0;
+            try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8);
+                    var writer = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (++seen > count - retain) {
+                        writer.write(line);
+                        writer.newLine();
+                    }
+                }
+            }
+            if (seen != count) {
+                throw new IOException("Player archive changed during retention: " + file);
+            }
+            var permissions = Files.getFileAttributeView(file, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+            if (permissions != null) {
+                Files.setPosixFilePermissions(temporary, permissions.readAttributes().permissions());
+            }
+            Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
     }
 
     private static final class PendingLogin {

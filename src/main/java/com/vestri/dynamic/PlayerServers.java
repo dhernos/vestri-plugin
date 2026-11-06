@@ -620,12 +620,11 @@ final class PlayerServers implements SimpleCommand {
     }
 
     private static Component notice(Component content) {
-        return Component.text("Vestri", NamedTextColor.DARK_AQUA)
-                .append(Component.text(" > ", NamedTextColor.DARK_GRAY)).append(content);
+        return PluginMessages.notice(content);
     }
 
     private static String safeMessage(String text) {
-        return text.replaceAll("(?i)[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", "your server");
+        return PluginMessages.safeText(text);
     }
 
     private String serverName(OwnedServerRegistry.Entry entry) {
