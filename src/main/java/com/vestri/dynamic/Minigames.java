@@ -10,6 +10,7 @@ import com.sun.net.httpserver.HttpServer;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import java.io.IOException;
@@ -46,6 +47,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         String serverId;
         String state = "provisioning";
         String matchId;
+        int rosterVersion;
         JsonObject specification;
         List<Member> roster = List.of();
         List<Matchmaker.Group> groups = List.of();
@@ -54,6 +56,9 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         transient long heartbeat;
         transient long emptySince;
         transient boolean transferPending;
+        transient List<UUID> pendingTransfers = List.of();
+        transient boolean rosterJoined;
+        transient boolean startupWarned;
         transient boolean requeue;
         transient boolean busy;
         transient long retryAfter;
@@ -220,7 +225,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 queues.values().forEach(queue -> queue.removeIf(group -> group.leader().equals(actor)));
                 for (Instance instance : instances) {
                     if (instance.groups.stream().anyMatch(group -> group.leader().equals(actor))
-                            && Set.of("joining", "starting").contains(instance.state)) {
+                            && (Set.of("joining", "starting").contains(instance.state)
+                                || instance.state.equals("running") && instance.deadline > 0)) {
                         end(instance, false);
                     }
                 }
@@ -245,7 +251,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 throw new IllegalArgumentException("This minigame needs its template API key configured by an administrator.");
             }
             List<UUID> members = parties.members(actor);
-            if (members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
+            if (!spec.teamfree() && members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
                 throw new IllegalArgumentException("Your party is too large for this minigame.");
             }
             for (UUID member : members) {
@@ -288,6 +294,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         }
         Instance instance = instances.stream().filter(value -> binding.serverId.equals(value.serverId)).findFirst().orElse(null);
         if (instance == null || !Set.of("joining", "starting", "running").contains(instance.state)
+            || instance.pendingTransfers.contains(event.getPlayer().getUniqueId())
                 || instance.roster.stream().noneMatch(member -> member.uuid.equals(event.getPlayer().getUniqueId().toString()))) {
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
         }
@@ -309,17 +316,24 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         queues.values().forEach(queue -> queue.removeIf(group -> !validGroup(group)));
         for (Instance instance : List.copyOf(instances)) {
             MinigameSpec spec = settings(instance);
+            if (instance.state.equals("provisioning") && instance.heartbeat == 0
+                    && !instance.startupWarned && now - instance.created >= 30000) {
+                instance.startupWarned = true;
+                logger.warn("Minigame startup stalled template={} instanceId={} requestId={}: no agent report after 30s; check server startup and agent configuration, and verify proxy DNS and port 25580 reachability from Paper",
+                        safeLog(instance.template), instance.serverId, instance.requestId);
+            }
             if (!templates.containsKey(instance.template)) {
                 end(instance, false);
             } else if (instance.state.equals("provisioning") && now - instance.created >= 300000) {
                 end(instance, false);
-            } else if (Set.of("joining", "starting").contains(instance.state) && now >= instance.deadline) {
+                } else if ((Set.of("joining", "starting").contains(instance.state)
+                    || instance.state.equals("running") && instance.deadline > 0) && now >= instance.deadline) {
                 end(instance, true);
             } else if (Set.of("ready", "running").contains(instance.state)
                     && now - (instance.heartbeat == 0 ? Math.max(instance.created, initialized) : instance.heartbeat) > 30000) {
                 end(instance, false);
             }
-            if (instance.state.equals("running") && spec != null && spec.whenEmpty()) {
+            if (instance.state.equals("running") && instance.deadline == 0 && spec != null && spec.whenEmpty()) {
                 if (occupants(instance).isEmpty()) {
                     if (instance.emptySince == 0) {
                         instance.emptySince = now;
@@ -343,9 +357,31 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             String name = template.getKey();
             MinigameSpec spec = template.getValue();
             List<Matchmaker.Group> queue = queues.computeIfAbsent(name, ignored -> new ArrayList<>());
+            if (spec.nativeLobby()) {
+                for (Instance nativeInstance : instances) {
+                    if (name.equals(nativeInstance.template) && nativeInstance.state.equals("running")
+                            && !nativeInstance.transferPending && nativeInstance.rosterJoined
+                            && occupants(nativeInstance).stream().map(Player::getUniqueId).collect(java.util.stream.Collectors.toSet())
+                                .containsAll(assignments(nativeInstance).keySet())
+                            && now - nativeInstance.heartbeat < 5000
+                            && compatible(nativeInstance.specification, templateSpecifications.get(name))) {
+                        Matchmaker.Match additions = Matchmaker.select(queue, spec.teams(), spec.teamSize(), 1,
+                                spec.maxPlayers(), assignments(nativeInstance));
+                        if (additions != null) {
+                            admit(nativeInstance, additions, queue, now);
+                        }
+                    }
+                }
+            }
             Instance available = instances.stream().filter(instance -> name.equals(instance.template) && instance.state.equals("ready")
                     && instance.heartbeat > 0 && now - instance.heartbeat < 5000).findFirst().orElse(null);
-            Matchmaker.Match match = Matchmaker.select(queue, spec.teams(), spec.teamSize(), spec.minPlayers(), spec.maxPlayers());
+            Matchmaker.Match match = Matchmaker.select(queue, spec.teams(), spec.teamSize(), spec.nativeLobby() ? 1 : spec.minPlayers(), spec.maxPlayers());
+            if (spec.nativeLobby() && instances.stream().anyMatch(instance -> name.equals(instance.template)
+                    && Set.of("joining", "running").contains(instance.state)
+                    && compatible(instance.specification, templateSpecifications.get(name))
+                    && Matchmaker.select(queue, spec.teams(), spec.teamSize(), 1, spec.maxPlayers(), assignments(instance)) != null)) {
+                match = null;
+            }
             if (available != null && match != null) {
                 reserve(available, match, queue, now);
             }
@@ -361,6 +397,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 instance.specification = templateSpecifications.get(name).deepCopy();
                 instances.add(instance);
                 save();
+                lifecycleLog("preparing", instance);
             }
         }
     }
@@ -399,17 +436,50 @@ final class Minigames implements SimpleCommand, AutoCloseable {
 
     private void reserve(Instance instance, Matchmaker.Match match, List<Matchmaker.Group> queue, long now) {
         instance.matchId = UUID.randomUUID().toString();
-        instance.roster = match.teams().entrySet().stream().map(entry -> new Member(entry.getKey().toString(),
-                proxy.getPlayer(entry.getKey()).orElseThrow().getUsername(), entry.getValue())).toList();
-        instance.groups = match.groups();
         instance.state = "joining";
+        admit(instance, match, queue, now);
+        lifecycleLog("reserving", instance);
+    }
+
+    private Map<UUID, String> assignments(Instance instance) {
+        Map<UUID, String> assignments = new LinkedHashMap<>();
+        instance.roster.forEach(member -> assignments.put(UUID.fromString(member.uuid), member.team));
+        return assignments;
+    }
+
+    private void admit(Instance instance, Matchmaker.Match match, List<Matchmaker.Group> queue, long now) {
+        List<Member> roster = new ArrayList<>(instance.roster);
+        match.teams().forEach((player, team) -> roster.add(new Member(player.toString(),
+                proxy.getPlayer(player).orElseThrow().getUsername(), team)));
+        instance.roster = List.copyOf(roster);
+        List<Matchmaker.Group> groups = new ArrayList<>(instance.groups);
+        groups.addAll(match.groups());
+        instance.groups = List.copyOf(groups);
+        instance.rosterVersion++;
+        instance.pendingTransfers = List.copyOf(match.teams().keySet());
         instance.transferPending = true;
-        instance.deadline = now + 15000;
+        instance.rosterJoined = false;
+        instance.emptySince = 0;
+        instance.deadline = now + (settings(instance).nativeLobby() ? settings(instance).joinTimeout() : 15000);
         save();
         if (!persistenceFailed) {
             queue.removeAll(match.groups());
-            tell(instance.roster.stream().map(member -> UUID.fromString(member.uuid)).toList(), "Match found for " + instance.template + ".");
+            tell(instance.pendingTransfers, "Match found for " + instance.template + ".");
+            if (settings(instance).nativeLobby()) {
+                lifecycleLog("native admission", instance);
+            }
         }
+    }
+
+    private void lifecycleLog(String event, Instance instance) {
+        logger.info("Minigame {} template={} instanceId={} requestId={} rosterVersion={} players={}",
+                event, safeLog(instance.template), instance.serverId, instance.requestId, instance.rosterVersion, instance.roster.size());
+    }
+
+    private static String safeLog(String message) {
+        String sanitized = message.replaceAll("(?i)(?:vmc_)?[a-f0-9]{64}", "[redacted]")
+                .replaceAll("[\\p{Cntrl}]", " ");
+        return sanitized.substring(0, Math.min(512, sanitized.length()));
     }
 
     private synchronized void submit(Instance instance, Runnable action) {
@@ -457,12 +527,21 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 }
                 save();
             }
-        } catch (IOException | InterruptedException failure) {
+        } catch (IOException | InterruptedException | RuntimeException failure) {
             if (failure instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            logger.warn("Minigame preparation pending for {}; the same request will be retried", instance.template);
+            logger.warn("Minigame preparation pending template={} requestId={} error={}: {}; the same request will be retried",
+                    safeLog(instance.template), instance.requestId, failure.getClass().getSimpleName(), safeFailure(failure));
         }
+    }
+
+    static String safeFailure(Exception failure) {
+        String message = failure.getMessage();
+        if (message == null) {
+            return "No error detail available";
+        }
+        return safeLog(message);
     }
 
     private void cleanup(Instance instance) {
@@ -500,6 +579,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         instance.state = "ending";
         instance.requeue = requeue;
         save();
+        lifecycleLog("end", instance);
         if (requeue && !persistenceFailed) {
             for (Matchmaker.Group group : instance.groups) {
                 if (validGroup(group) && group.players().stream().noneMatch(this::queuedOrPlaying)) {
@@ -532,6 +612,32 @@ final class Minigames implements SimpleCommand, AutoCloseable {
 
     private void tell(List<UUID> players, String message) {
         players.forEach(player -> proxy.getPlayer(player).ifPresent(online -> online.sendMessage(Component.text(message))));
+    }
+
+    private void connect(Instance instance, Player player, RegisteredServer server) {
+        try {
+            player.createConnectionRequest(server).connect().whenComplete((result, failure) -> {
+                if (failure != null || result == null || !result.isSuccessful()) {
+                    String reason = failure != null ? failure.getClass().getSimpleName()
+                            : result == null ? "No connection result" : connectionReason(result);
+                    logger.warn("Minigame transfer rejected template={} instanceId={} matchId={} player={} reason={}",
+                            safeLog(instance.template), instance.serverId, instance.matchId,
+                            player.getUniqueId(), safeLog(reason));
+                    player.sendMessage(Component.text("Could not join the minigame. Check with an administrator; the match join timeout still applies."));
+                } else {
+                    logger.info("Minigame transfer connected template={} instanceId={} player={}",
+                            safeLog(instance.template), instance.serverId, player.getUniqueId());
+                }
+            });
+        } catch (RuntimeException failure) {
+            logger.warn("Minigame transfer failed template={} instanceId={} player={} error={}: {}",
+                    safeLog(instance.template), instance.serverId, player.getUniqueId(),
+                    failure.getClass().getSimpleName(), safeFailure(failure));
+        }
+    }
+
+    static String connectionReason(ConnectionRequestBuilder.Result result) {
+        return result.getStatus().name() + result.getReasonComponent().map(reason -> ": " + reason).orElse("");
     }
 
     private void heartbeat(HttpExchange exchange) throws IOException {
@@ -591,6 +697,20 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         if (instance.matchId != null && reportedMatch != null && !instance.matchId.equals(reportedMatch)) {
             throw new IllegalArgumentException();
         }
+        Integer reportedVersion = null;
+        if (report.has("rosterVersion")) {
+            var version = report.get("rosterVersion");
+            if (!version.isJsonPrimitive() || !version.getAsJsonPrimitive().isNumber()) {
+                throw new IllegalArgumentException();
+            }
+            reportedVersion = version.getAsBigDecimal().intValueExact();
+            if (reportedVersion < 0 || reportedVersion > instance.rosterVersion) {
+                throw new IllegalArgumentException();
+            }
+        }
+        boolean nativeLobby = settings(instance).nativeLobby();
+        boolean acknowledged = instance.matchId != null && instance.matchId.equals(reportedMatch)
+                && (!nativeLobby || reportedVersion != null && reportedVersion == instance.rosterVersion);
         instance.heartbeat = now;
         if (instance.matchId == null && reportedMatch != null) {
             end(instance, false);
@@ -598,39 +718,55 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         if (instance.state.equals("provisioning") && state.equals("ready") && reportedMatch == null && players.isEmpty()) {
             instance.state = "ready";
             save();
+            lifecycleLog("ready", instance);
         }
         if (state.equals("failed") || state.equals("ended")) {
             if (instance.matchId == null || instance.matchId.equals(reportedMatch)) {
                 end(instance, false);
             }
         }
-        if (instance.state.equals("joining") && instance.transferPending && instance.matchId.equals(reportedMatch)) {
+        if (Set.of("joining", "running").contains(instance.state) && instance.transferPending && acknowledged
+                && Set.of("joining", "running").contains(state)) {
+            List<UUID> transfers = instance.pendingTransfers;
+            instance.pendingTransfers = List.of();
             instance.transferPending = false;
             instance.deadline = now + settings(instance).joinTimeout();
+            if (nativeLobby && instance.state.equals("joining")) {
+                instance.state = "running";
+                lifecycleLog("start", instance);
+            }
             save();
             Binding binding = bindings.get(instance.slug);
             if (!persistenceFailed && binding != null) {
-                proxy.getServer(binding.name).ifPresent(server -> instance.roster.forEach(member -> proxy.getPlayer(UUID.fromString(member.uuid))
-                    .ifPresent(player -> player.createConnectionRequest(server).connect())));
+                proxy.getServer(binding.name).ifPresent(server -> transfers.forEach(member -> proxy.getPlayer(member)
+                    .ifPresent(player -> connect(instance, player, server))));
             }
         }
-        if (instance.matchId != null && instance.matchId.equals(reportedMatch)) {
+        if (acknowledged) {
             boolean allJoined = instance.roster.stream().allMatch(member -> players.contains(member.uuid))
                     && occupants(instance).stream().map(player -> player.getUniqueId().toString()).collect(java.util.stream.Collectors.toSet())
                     .containsAll(instance.roster.stream().map(Member::uuid).toList());
-            if (instance.state.equals("joining") && !instance.transferPending && allJoined) {
+            if (nativeLobby && instance.state.equals("running") && !instance.transferPending) {
+                instance.rosterJoined = allJoined && state.equals("running");
+                if (instance.rosterJoined) {
+                    instance.deadline = 0;
+                }
+            } else if (instance.state.equals("joining") && !instance.transferPending && allJoined) {
                 instance.state = "starting";
                 instance.deadline = now + 30000;
                 save();
             } else if (instance.state.equals("starting") && state.equals("running") && allJoined) {
                 instance.state = "running";
+                instance.deadline = 0;
                 save();
+                lifecycleLog("start", instance);
             }
         }
         JsonObject response = new JsonObject();
         response.addProperty("state", instance.state.equals("provisioning") ? "ready" : instance.state);
         if (instance.matchId != null) {
             response.addProperty("matchId", instance.matchId);
+            response.addProperty("rosterVersion", instance.rosterVersion);
             response.add("roster", JSON.toJsonTree(instance.roster));
         }
         return response;

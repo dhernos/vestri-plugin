@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import org.bukkit.event.EventHandler;
@@ -55,6 +56,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     private final JavaPlugin plugin;
     private final Configuration config;
     private final MatchFence fence;
+    private final Diagnostics diagnostics;
     private final AtomicReference<Control> incoming = new AtomicReference<>();
     private final AtomicBoolean endRequested = new AtomicBoolean();
     private final ScheduledExecutorService polling = Executors.newSingleThreadScheduledExecutor(task -> {
@@ -85,9 +87,15 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
 
     MinigameAgent(JavaPlugin plugin, Configuration config, Path execution) throws IOException {
+        this(plugin, config, execution, new Diagnostics(plugin == null
+                ? Logger.getLogger(MinigameAgent.class.getName()) : plugin.getLogger(), System::nanoTime));
+    }
+
+    MinigameAgent(JavaPlugin plugin, Configuration config, Path execution, Diagnostics diagnostics) throws IOException {
         this.plugin = plugin;
         this.config = config;
-        fence = new MatchFence(execution, config.teams());
+        this.diagnostics = diagnostics;
+        fence = new MatchFence(execution, config.teams(), config.lobbyMode());
         if (fence.roster() != null) {
             roster = fence.roster();
             allowed = Set.copyOf(roster.stream().map(Member::uuid).toList());
@@ -114,10 +122,13 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
             Configuration config = configuration(new String(bytes, StandardCharsets.UTF_8));
             MinigameAgent agent = new MinigameAgent(plugin, config);
+            plugin.getLogger().info(loadedMessage(config));
             agent.enable();
             return agent;
         } catch (IOException | RuntimeException failure) {
-            plugin.getLogger().warning("Minigame agent unavailable: invalid configuration or execution fence; player entry denied.");
+            plugin.getLogger().warning(Files.notExists(path)
+                    ? "Minigame agent unavailable: missing minigame.json with an existing execution fence; player entry denied."
+                    : "Minigame agent unavailable: invalid configuration or execution fence; player entry denied.");
             plugin.getServer().getPluginManager().registerEvents(new DenyEntry(), plugin);
             return null;
         }
@@ -183,6 +194,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             readySignalled = true;
             if (fence.matchId() == null) {
                 state = "ready";
+            } else if (config.lobbyMode().equals("plugin")) {
+                state = "running";
             }
         }
     }
@@ -209,7 +222,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
 
     String statusReport(Set<UUID> online) {
-        return JSON.toJson(new Report(state, fence.matchId(), online.stream().map(UUID::toString).sorted().toList()));
+        return JSON.toJson(new Report(state, fence.matchId(), online.stream().map(UUID::toString).sorted().toList(),
+            fence.rosterVersion()));
     }
 
     void apply(Control response, Set<UUID> online, Predicate<String> execute) {
@@ -220,7 +234,9 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             return;
         }
         try {
-            if (!fence.accept(response.matchId(), response.roster())) {
+            boolean nativeLobby = config.lobbyMode().equals("plugin");
+            if (!(nativeLobby ? fence.updateNative(response.matchId(), response.roster(), response.rosterVersion())
+                    : fence.accept(response.matchId(), response.roster()))) {
                 return;
             }
             if (fence.roster() != null) {
@@ -229,6 +245,10 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
             if (response.state().equals("ending")) {
                 end();
+                return;
+            }
+            if (nativeLobby) {
+                state = readySignalled ? "running" : "joining";
                 return;
             }
             if (!state.equals("running")) {
@@ -245,27 +265,91 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
         } catch (RuntimeException failure) {
             state = "failed";
-            (plugin == null ? Logger.getLogger(MinigameAgent.class.getName()) : plugin.getLogger())
-                    .warning("Minigame assignment or startup actions failed.");
+            diagnostics.logger.warning("Minigame assignment or startup actions failed.");
         }
     }
 
     private void poll() {
-        String snapshot = report;
+        Control response = poll(report);
+        if (!closed && response != null) {
+            incoming.set(response);
+        }
+    }
+
+    Control poll(String snapshot) {
         if (closed || snapshot == null) {
-            return;
+            return null;
         }
         try {
             HttpRequest request = HttpRequest.newBuilder(config.endpoint()).timeout(Duration.ofSeconds(3))
                     .header("Authorization", "Bearer " + config.token()).header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(snapshot)).build();
             HttpResponse<byte[]> response = exchange(client, request, Duration.ofSeconds(3));
-            if (!closed && response.statusCode() == 200) {
-                incoming.set(control(new String(response.body(), StandardCharsets.UTF_8), config.teams()));
+            if (closed) {
+                return null;
             }
+            if (response.statusCode() != 200) {
+                diagnostics.failure("HTTP status=" + response.statusCode());
+                return null;
+            }
+            Control parsed;
+            try {
+                parsed = control(new String(response.body(), StandardCharsets.UTF_8), config.teams());
+            } catch (RuntimeException failure) {
+                diagnostics.failure("invalid response class=" + failure.getClass().getSimpleName());
+                return null;
+            }
+            diagnostics.recovered();
+            return parsed;
         } catch (InterruptedException failure) {
             Thread.currentThread().interrupt();
+            if (!closed) {
+                diagnostics.failure("transport class=InterruptedException");
+            }
         } catch (ExecutionException | TimeoutException | RuntimeException failure) {
+            if (!closed) {
+                Throwable cause = failure instanceof ExecutionException && failure.getCause() != null
+                        ? failure.getCause() : failure;
+                diagnostics.failure("transport class=" + cause.getClass().getSimpleName());
+            }
+        }
+        return null;
+    }
+
+    static String loadedMessage(Configuration config) {
+        String path = config.endpoint().getPath();
+        String slug = path.substring(path.lastIndexOf('/') + 1);
+        return "Minigame agent configured: slug=" + slug + ", lobbyMode=" + config.lobbyMode()
+                + ", readiness=" + config.trigger();
+    }
+
+    static final class Diagnostics {
+        private final Logger logger;
+        private final LongSupplier clock;
+        private boolean failing;
+        private boolean warned;
+        private long lastWarning;
+
+        Diagnostics(Logger logger, LongSupplier clock) {
+            this.logger = logger;
+            this.clock = clock;
+        }
+
+        void failure(String detail) {
+            failing = true;
+            long now = clock.getAsLong();
+            if (!warned || now - lastWarning >= TimeUnit.SECONDS.toNanos(30)) {
+                warned = true;
+                lastWarning = now;
+                logger.warning("Minigame control unavailable: " + detail.substring(0, Math.min(detail.length(), 120)) + ".");
+            }
+        }
+
+        void recovered() {
+            if (failing) {
+                failing = false;
+                logger.info("Minigame control recovered.");
+            }
         }
     }
 
@@ -322,12 +406,17 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             throw new IllegalArgumentException();
         }
         JsonObject spec = root.getAsJsonObject("spec");
+        String lobbyMode = spec.has("lobbyMode") ? string(spec.get("lobbyMode")) : "vestri";
+        if (!Set.of("vestri", "plugin").contains(lobbyMode)) {
+            throw new IllegalArgumentException();
+        }
         List<String> teams = new ArrayList<>();
-        JsonArray definitions = spec.getAsJsonArray("teams");
+        JsonArray definitions = spec.has("teams") && !spec.get("teams").isJsonNull()
+            ? spec.getAsJsonArray("teams") : null;
         if (definitions != null) {
             definitions.forEach(value -> teams.add(identifier(string(value))));
         }
-        if (teams.isEmpty() || teams.size() > 100 || new HashSet<>(teams).size() != teams.size()) {
+        if (teams.size() > 100 || new HashSet<>(teams).size() != teams.size()) {
             throw new IllegalArgumentException();
         }
         JsonObject lifecycle = spec.getAsJsonObject("lifecycle");
@@ -344,14 +433,15 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 String forEach = entry.has("forEach") ? string(entry.get("forEach")) : "";
                 if (command.isBlank() || command.getBytes(StandardCharsets.UTF_8).length > 1024
                         || command.strip().startsWith("/") || command.chars().anyMatch(Character::isISOControl)
-                        || !Set.of("", "team", "player").contains(forEach)) {
+                        || !Set.of("", "team", "player").contains(forEach)
+                        || (teams.isEmpty() && forEach.equals("team"))) {
                     throw new IllegalArgumentException();
                 }
                 var placeholders = Pattern.compile("\\{([^{}]*)\\}").matcher(command);
                 while (placeholders.find()) {
                     String placeholder = placeholders.group(1);
                     if (!Set.of("matchId", "team", "player", "uuid").contains(placeholder)
-                            || (placeholder.equals("team") && forEach.isEmpty())
+                            || (placeholder.equals("team") && (forEach.isEmpty() || teams.isEmpty()))
                             || (Set.of("player", "uuid").contains(placeholder) && !forEach.equals("player"))) {
                         throw new IllegalArgumentException();
                     }
@@ -372,7 +462,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             throw new IllegalArgumentException();
         }
         return new Configuration(URI.create(url.replaceAll("/$", "") + "/minigame/" + slug), token,
-                List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern));
+            List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern), lobbyMode);
     }
 
     static Control control(String text, List<String> teams) {
@@ -383,26 +473,50 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
         UUID matchId = root.has("matchId") && !root.get("matchId").isJsonNull()
                 ? uuid(root.get("matchId").getAsString()) : null;
+        int rosterVersion = version(root);
         List<Member> members = null;
         if (root.has("roster") && !root.get("roster").isJsonNull()) {
             members = new ArrayList<>();
             for (var value : root.getAsJsonArray("roster")) {
                 JsonObject member = value.getAsJsonObject();
-                String name = member.get("name").getAsString();
+                String name = string(member.get("name"));
                 String team = member.has("team") && !member.get("team").isJsonNull()
-                        ? member.get("team").getAsString() : "";
-                if (!name.matches("[A-Za-z0-9_]{1,16}") || (!team.isEmpty() && !teams.contains(team))) {
-                    throw new IllegalArgumentException();
-                }
+                        ? string(member.get("team")) : "";
                 members.add(new Member(uuid(member.get("uuid").getAsString()), name, team));
             }
-            if (members.size() > 512 || new HashSet<>(members.stream().map(Member::uuid).toList()).size() != members.size()
-                    || matchId == null) {
+            validateRoster(members, teams);
+            if (matchId == null) {
                 throw new IllegalArgumentException();
             }
             members = List.copyOf(members);
         }
-        return new Control(state, matchId, members);
+        return new Control(state, matchId, members, rosterVersion);
+    }
+
+    private static int version(JsonObject root) {
+        if (!root.has("rosterVersion")) {
+            return 0;
+        }
+        var value = root.get("rosterVersion");
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()
+                || !value.getAsString().matches("0|[1-9][0-9]*")) {
+            throw new IllegalArgumentException("Invalid roster version");
+        }
+        return Integer.parseInt(value.getAsString());
+    }
+
+    private static void validateRoster(List<Member> members, List<String> teams) {
+        Set<UUID> ids = new HashSet<>();
+        if (members.size() > 512) {
+            throw new IllegalArgumentException();
+        }
+        for (Member member : members) {
+            if (member == null || member.uuid() == null || !ids.add(member.uuid()) || member.name() == null
+                    || !member.name().matches("[A-Za-z0-9_]{1,16}") || member.team() == null
+                    || (teams.isEmpty() ? !member.team().isEmpty() : !teams.contains(member.team()))) {
+                throw new IllegalArgumentException();
+            }
+        }
     }
 
     private static UUID uuid(String text) {
@@ -451,19 +565,37 @@ public final class MinigameAgent implements Listener, AutoCloseable {
 
     record Action(String command, String forEach) { }
     record Member(UUID uuid, String name, String team) { }
-    record Control(String state, UUID matchId, List<Member> roster) { }
-    record Report(String state, UUID matchId, List<String> players) { }
+    record Control(String state, UUID matchId, List<Member> roster, int rosterVersion) {
+        Control(String state, UUID matchId, List<Member> roster) {
+            this(state, matchId, roster, 0);
+        }
+    }
+    record Report(String state, UUID matchId, List<String> players, int rosterVersion) { }
     record Configuration(URI endpoint, String token, List<String> teams, String trigger,
-            List<Action> actions, Pattern endPattern) { }
+            List<Action> actions, Pattern endPattern, String lobbyMode) {
+        Configuration(URI endpoint, String token, List<String> teams, String trigger,
+                List<Action> actions, Pattern endPattern) {
+            this(endpoint, token, teams, trigger, actions, endPattern, "vestri");
+        }
+    }
 
     static final class MatchFence {
         private final Path path;
+        private final List<String> teams;
+        private final String lobbyMode;
         private UUID matchId;
         private boolean startupClaimed;
         private List<Member> roster;
+        private int rosterVersion;
 
         MatchFence(Path path, List<String> teams) throws IOException {
+            this(path, teams, "vestri");
+        }
+
+        MatchFence(Path path, List<String> teams, String lobbyMode) throws IOException {
             this.path = path;
+            this.teams = List.copyOf(teams);
+            this.lobbyMode = lobbyMode;
             if (Files.exists(path)) {
                 byte[] bytes;
                 try (var input = Files.newInputStream(path)) {
@@ -481,11 +613,18 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 Control restored = control(saved.toString(), teams);
                 matchId = restored.matchId();
                 roster = restored.roster();
+                rosterVersion = restored.rosterVersion();
                 startupClaimed = claimed.getAsBoolean();
-                if (matchId == null || (startupClaimed && (roster == null || roster.isEmpty()))) {
+                if (matchId == null || (startupClaimed && (roster == null
+                        || (roster.isEmpty() && !lobbyMode.equals("plugin"))))
+                        || (lobbyMode.equals("plugin") && (!startupClaimed || rosterVersion == 0))) {
                     throw new IllegalArgumentException("Invalid execution fence");
                 }
             }
+        }
+
+        int rosterVersion() {
+            return rosterVersion;
         }
 
         boolean startupClaimed() {
@@ -505,7 +644,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
 
         boolean accept(UUID candidate, List<Member> members) {
-            if (candidate == null) {
+            if (candidate == null || !lobbyMode.equals("vestri")) {
                 return false;
             }
             if (matchId != null && !matchId.equals(candidate)) {
@@ -522,6 +661,29 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             return true;
         }
 
+        boolean updateNative(UUID candidate, List<Member> members, int version) {
+            if (!lobbyMode.equals("plugin") || candidate == null || members == null || version < 1
+                    || (matchId != null && !matchId.equals(candidate))) {
+                return false;
+            }
+            validateRoster(members, teams);
+            List<Member> updated = List.copyOf(members);
+            if (roster != null) {
+                if (version <= rosterVersion) {
+                    return roster.size() == updated.size() && updated.containsAll(roster);
+                }
+                if (!updated.containsAll(roster)) {
+                    return false;
+                }
+            }
+            persist(candidate, true, updated, version);
+            matchId = candidate;
+            roster = updated;
+            rosterVersion = version;
+            startupClaimed = true;
+            return true;
+        }
+
         boolean claimStartup(UUID candidate) {
             if (!accept(candidate) || startupClaimed || roster == null || roster.isEmpty()) {
                 return false;
@@ -532,10 +694,14 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
 
         private void persist(UUID candidate, boolean claimed, List<Member> members) {
+            persist(candidate, claimed, members, rosterVersion);
+        }
+
+        private void persist(UUID candidate, boolean claimed, List<Member> members, int version) {
             Path temporary = null;
             try {
                 Files.createDirectories(path.getParent());
-                byte[] bytes = JSON.toJson(new Execution(candidate, claimed, members)).getBytes(StandardCharsets.UTF_8);
+                byte[] bytes = JSON.toJson(new Execution(candidate, claimed, members, version)).getBytes(StandardCharsets.UTF_8);
                 if (bytes.length > MAX_BYTES) {
                     throw new IOException("Execution fence exceeds size limit");
                 }
@@ -563,7 +729,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
         }
 
-        private record Execution(UUID matchId, boolean startupClaimed, List<Member> roster) { }
+        private record Execution(UUID matchId, boolean startupClaimed, List<Member> roster, int rosterVersion) { }
     }
 
     static final class BoundedBody implements HttpResponse.BodySubscriber<byte[]> {

@@ -25,12 +25,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import net.kyori.adventure.text.Component;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -43,12 +45,764 @@ class MinigamesTest {
     private final AtomicLong clock = new AtomicLong(1000000);
     private final ProxyServer proxy = mock(ProxyServer.class);
     private final Parties parties = new Parties();
+    private final Logger logger = mock(Logger.class);
     private Minigames service;
     private static final String TOKEN = "a".repeat(64);
     private static final String SERVER_ID = "11111111-1111-1111-1111-111111111111";
     private final List<Player> occupants = new ArrayList<>();
     private final List<UUID> transfers = new ArrayList<>();
     private RegisteredServer target;
+
+    @Test
+    void nativeHttpProtocolPersistsFullFfaRosterBeforeEachVersionedTransfer() throws Exception {
+        JsonObject manifest = lobbyManifest(true, true);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.addProperty("minPlayers", 3);
+        manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
+        Minigames.Instance instance = ready(manifest);
+        instance.state = "provisioning";
+        instance.heartbeat = 0;
+        Path execution = directory.resolve("paper-execution.json");
+        try (PaperAgent paper = new PaperAgent(spec, execution)) {
+            paper.agent.ready();
+            Object initial = paper.exchange(Set.of());
+            assertEquals("ready", paper.value(initial, "state"));
+            assertEquals("ready", instance.state);
+            Player[] first = party(2);
+            queue(first[0]);
+            service.sweep();
+            assertEquals(2, instance.roster.size());
+            assertEquals(1, instance.groups.size());
+            assertTrue(instance.roster.size() < spec.get("minPlayers").getAsInt());
+            assertTrue(instance.roster.stream().allMatch(member -> member.team().isEmpty()));
+            Object assigned = paper.exchange(Set.of());
+            String matchId = instance.matchId;
+            assertEquals("joining", paper.value(assigned, "state"));
+            assertEquals(1, paper.value(assigned, "rosterVersion"));
+            assertTrue(transfers.isEmpty());
+            assertPaperRoster(execution, instance, 1);
+            assertEquals(1, paper.report(Set.of()).get("rosterVersion").getAsInt());
+            for (Player member : first) {
+                assertTrue(paper.allows(member.getUniqueId()));
+            }
+            assertFalse(paper.allows(UUID.randomUUID()));
+            paper.exchange(Set.of());
+            List<UUID> firstIds = List.of(first).stream().map(Player::getUniqueId).toList();
+            assertEquals(firstIds, transfers);
+            assertEquals("running", instance.state);
+            assertFalse(instance.rosterJoined);
+            occupants.addAll(List.of(first));
+            Set<UUID> online = Set.copyOf(firstIds);
+            paper.exchange(online);
+            assertTrue(instance.rosterJoined);
+            assertEquals(0, instance.deadline);
+
+            Player[] second = party(2);
+            queue(second[0]);
+            service.sweep();
+            assertEquals(matchId, instance.matchId);
+            assertEquals("running", instance.state);
+            assertEquals(2, instance.groups.size());
+            assertEquals(4, instance.roster.size());
+            assertEquals(2, instance.rosterVersion);
+            assertEquals(List.of(second).stream().map(Player::getUniqueId).toList(), instance.pendingTransfers);
+            Object appended = paper.exchange(online);
+            assertEquals("running", paper.value(appended, "state"));
+            assertEquals(2, paper.value(appended, "rosterVersion"));
+            assertEquals(4, ((List<?>) paper.value(appended, "roster")).size());
+            assertEquals(firstIds, transfers, "Version 1 must not acknowledge the appended roster");
+            assertPaperRoster(execution, instance, 2);
+            assertEquals(2, paper.report(online).get("rosterVersion").getAsInt());
+            for (Player member : occupants) {
+                assertTrue(paper.allows(member.getUniqueId()));
+            }
+            for (Player member : second) {
+                assertTrue(paper.allows(member.getUniqueId()));
+            }
+            paper.exchange(online);
+            List<UUID> allIds = new ArrayList<>(firstIds);
+            allIds.addAll(List.of(second).stream().map(Player::getUniqueId).toList());
+            assertEquals(allIds, transfers, "Only the newly appended party is transferred");
+            paper.exchange(online);
+            assertEquals(allIds, transfers, "Acknowledgment replay must not transfer again");
+            occupants.addAll(List.of(second));
+            online = Set.copyOf(allIds);
+            paper.exchange(online);
+            assertTrue(instance.rosterJoined);
+            assertEquals(0, instance.deadline);
+            paper.observeLog("Game finished");
+            paper.apply(null, online);
+            assertEquals("ended", paper.report(online).get("state").getAsString());
+            Object ending = paper.exchange(online);
+            assertEquals("ending", paper.value(ending, "state"));
+            assertEquals("ending", instance.state);
+            assertEquals("ending", persisted().get(0).state);
+            assertFalse(paper.allows(firstIds.get(0)));
+            assertTrue(queue().isEmpty());
+            assertEquals(allIds, transfers);
+        }
+    }
+
+    @Test
+    void managedHttpProtocolAcceptsPaperVersionZeroAndRunsStartupOnce() throws Exception {
+        JsonObject manifest = lobbyManifest(false, true);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.getAsJsonObject("lifecycle").add("onAllJoined", JsonParser.parseString(
+                "[{\"command\":\"start {matchId}\"}]"));
+        manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
+        Minigames.Instance instance = ready(manifest);
+        Path execution = directory.resolve("managed-paper-execution.json");
+        try (PaperAgent paper = new PaperAgent(spec, execution)) {
+            paper.agent.ready();
+            Player[] players = party(2);
+            queue(players[0]);
+            service.sweep();
+            Object assigned = paper.exchange(Set.of());
+            assertEquals("joining", paper.value(assigned, "state"));
+            assertEquals(1, paper.value(assigned, "rosterVersion"));
+            assertEquals(1, instance.rosterVersion);
+            JsonObject ack = paper.report(Set.of());
+            assertEquals("joining", ack.get("state").getAsString());
+            assertEquals(instance.matchId, ack.get("matchId").getAsString());
+            assertEquals(0, ack.get("rosterVersion").getAsInt());
+            assertTrue(transfers.isEmpty());
+            assertTrue(instance.transferPending);
+            paper.exchange(Set.of());
+            List<UUID> ids = List.of(players).stream().map(Player::getUniqueId).toList();
+            assertEquals(ids, transfers, "Managed version 0 acknowledgment must release transfers");
+            assertFalse(instance.transferPending);
+            assertEquals("joining", instance.state);
+            paper.exchange(Set.of());
+            assertEquals(ids, transfers);
+            occupants.addAll(List.of(players));
+            Set<UUID> online = Set.copyOf(ids);
+            List<String> commands = new ArrayList<>();
+            Object starting = paper.exchange(online, command -> {
+                commands.add(command);
+                return true;
+            });
+            assertEquals("starting", paper.value(starting, "state"));
+            assertEquals(List.of("start " + instance.matchId), commands);
+            assertEquals("running", paper.report(online).get("state").getAsString());
+            assertEquals(0, paper.report(online).get("rosterVersion").getAsInt());
+            JsonObject saved = JsonParser.parseString(Files.readString(execution)).getAsJsonObject();
+            assertTrue(saved.get("startupClaimed").getAsBoolean());
+            assertEquals(0, saved.get("rosterVersion").getAsInt());
+            assertEquals(new Gson().toJsonTree(instance.roster), saved.get("roster"));
+            Object running = paper.exchange(online);
+            assertEquals("running", paper.value(running, "state"));
+            assertEquals("running", instance.state);
+            assertEquals(ids, transfers);
+            assertEquals(1, commands.size());
+        }
+    }
+
+    private void assertPaperRoster(Path execution, Minigames.Instance instance, int version) throws Exception {
+        JsonObject saved = JsonParser.parseString(Files.readString(execution)).getAsJsonObject();
+        assertEquals(instance.matchId, saved.get("matchId").getAsString());
+        assertEquals(version, saved.get("rosterVersion").getAsInt());
+        assertTrue(saved.get("startupClaimed").getAsBoolean());
+        assertEquals(new Gson().toJsonTree(instance.roster), saved.get("roster"));
+    }
+
+    private static final class PaperAgent implements AutoCloseable {
+        private final com.vestri.dynamic.bukkit.MinigameAgent agent;
+        private final Class<?> control = Class.forName("com.vestri.dynamic.bukkit.MinigameAgent$Control");
+
+        PaperAgent(JsonObject spec, Path execution) throws Exception {
+            JsonObject configuration = new JsonObject();
+            configuration.addProperty("slug", "mcgame-arena");
+            configuration.addProperty("token", TOKEN);
+            configuration.addProperty("controlUrl", "http://vestri-proxy:25580");
+            JsonObject paperSpec = spec.deepCopy();
+            JsonObject lifecycle = paperSpec.getAsJsonObject("lifecycle");
+            lifecycle.add("ready", JsonParser.parseString("{\"trigger\":\"explicit\"}"));
+            lifecycle.getAsJsonObject("end").addProperty("logPattern", "Game finished");
+            configuration.add("spec", paperSpec);
+            Object parsed = invoke("configuration", new Class<?>[]{String.class}, null, configuration.toString());
+            var components = parsed.getClass().getRecordComponents();
+            Class<?>[] types = new Class<?>[components.length];
+            Object[] values = new Object[components.length];
+            for (int index = 0; index < components.length; index++) {
+                types[index] = components[index].getType();
+                var accessor = components[index].getAccessor();
+                accessor.setAccessible(true);
+                values[index] = accessor.invoke(parsed);
+            }
+            values[0] = URI.create("http://127.0.0.1:25580/minigame/arena");
+            var configConstructor = parsed.getClass().getDeclaredConstructor(types);
+            configConstructor.setAccessible(true);
+            Object local = configConstructor.newInstance(values);
+            var constructor = com.vestri.dynamic.bukkit.MinigameAgent.class.getDeclaredConstructor(
+                    org.bukkit.plugin.java.JavaPlugin.class, parsed.getClass(), Path.class);
+            constructor.setAccessible(true);
+            agent = (com.vestri.dynamic.bukkit.MinigameAgent) constructor.newInstance(null, local, execution);
+        }
+
+        Object exchange(Set<UUID> online) throws Exception {
+            return exchange(online, command -> fail("Unexpected setup command"));
+        }
+
+        Object exchange(Set<UUID> online, java.util.function.Predicate<String> execute) throws Exception {
+            Object response = invoke("poll", new Class<?>[]{String.class}, agent, report(online).toString());
+            assertNotNull(response, "The real Paper HTTP helper must accept the proxy response");
+            apply(response, online, execute);
+            return response;
+        }
+
+        void apply(Object response, Set<UUID> online) throws Exception {
+            apply(response, online, command -> fail("Native mode must not dispatch setup commands"));
+        }
+
+        private void apply(Object response, Set<UUID> online, java.util.function.Predicate<String> execute) throws Exception {
+            invoke("apply", new Class<?>[]{control, Set.class, java.util.function.Predicate.class}, agent,
+                    response, online, execute);
+        }
+
+        JsonObject report(Set<UUID> online) throws Exception {
+            return JsonParser.parseString((String) invoke("statusReport", new Class<?>[]{Set.class}, agent, online))
+                    .getAsJsonObject();
+        }
+
+        boolean allows(UUID player) throws Exception {
+            return (boolean) invoke("allows", new Class<?>[]{UUID.class}, agent, player);
+        }
+
+        void observeLog(String message) throws Exception {
+            invoke("observeLog", new Class<?>[]{String.class}, agent, message);
+        }
+
+        Object value(Object response, String name) throws Exception {
+            var accessor = control.getDeclaredMethod(name);
+            accessor.setAccessible(true);
+            return accessor.invoke(response);
+        }
+
+        private static Object invoke(String name, Class<?>[] types, Object receiver, Object... arguments) throws Exception {
+            var method = com.vestri.dynamic.bukkit.MinigameAgent.class.getDeclaredMethod(name, types);
+            method.setAccessible(true);
+            return method.invoke(receiver, arguments);
+        }
+
+        @Override
+        public void close() {
+            agent.close();
+        }
+    }
+
+    @Test
+    void vestriTeamfreePartyCanExceedTeamSizeAndRetainsTheManagedStartupSequence() throws Exception {
+        JsonObject manifest = lobbyManifest(false, true);
+        Minigames.Instance instance = ready(manifest);
+        Player[] players = party(3);
+        queue(players[0]);
+        service.sweep();
+        assertEquals(3, instance.roster.size());
+        assertTrue(instance.roster.stream().allMatch(member -> member.team().isEmpty()));
+        assertTrue(transfers.isEmpty());
+        service.report(instance, report("joining", instance.matchId));
+        assertEquals(3, transfers.size());
+        occupants.addAll(List.of(players));
+        service.report(instance, report("joining", instance.matchId, players));
+        assertEquals("starting", instance.state);
+        service.report(instance, report("running", instance.matchId, players));
+        assertEquals("running", instance.state);
+    }
+
+    @Test
+    void nativeSoloCreatesDemandBelowMinPlayersEvenWithoutAWarmPool() throws Exception {
+        JsonObject manifest = lobbyManifest(true, true);
+        manifest.getAsJsonObject("servers").remove("arena");
+        configure("Arena");
+        start(manifest);
+        queue(player("Solo"));
+        sweepWithoutNetwork(10);
+        assertEquals(1, instances().size());
+        assertEquals("provisioning", instances().get(0).state);
+        assertEquals(1, queue().size());
+    }
+
+    @Test
+    void nativeInitialReservationRequiresVersionAndBypassesManagedStarting() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player first = player("First");
+        queue(first);
+        service.sweep();
+        assertEquals("joining", instance.state);
+        assertEquals(1, instance.rosterVersion);
+        assertEquals(clock.get() + 10000, instance.deadline);
+        assertEquals(List.of(first.getUniqueId()), instance.pendingTransfers);
+        JsonObject response = service.report(instance, report("ready", null));
+        assertEquals("joining", response.get("state").getAsString());
+        assertEquals(1, response.get("rosterVersion").getAsInt());
+        assertEquals(1, response.getAsJsonArray("roster").size());
+        assertFalse(response.has("commands"));
+        for (String state : List.of("joining", "running")) {
+            service.report(instance, report(state, instance.matchId, first));
+        }
+        assertTrue(transfers.isEmpty());
+        ServerPreConnectEvent premature = new ServerPreConnectEvent(first, target);
+        service.beforeConnect(premature);
+        assertTrue(premature.getResult().getServer().isEmpty());
+        JsonObject ack = versionedReport(instance, "running", 1);
+        response = service.report(instance, ack);
+        assertEquals("running", response.get("state").getAsString());
+        assertEquals("running", instance.state);
+        assertFalse(instance.transferPending);
+        assertEquals(List.of(first.getUniqueId()), transfers);
+        assertFalse(instance.rosterJoined);
+        long deadline = instance.deadline;
+        clock.incrementAndGet();
+        service.report(instance, ack);
+        assertEquals(deadline, instance.deadline);
+        assertEquals(1, transfers.size());
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        assertTrue(instance.rosterJoined);
+        assertEquals(0, instance.deadline);
+        assertEquals("running", persisted().get(0).state);
+        assertEquals(1, persisted().get(0).rosterVersion);
+    }
+
+    @Test
+    void nativeAdditionsWaitForBothPreviousViewsAndAckTheWholeNewRosterBeforeTransfer() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player first = player("First");
+        Player second = player("Second");
+        Player third = player("Third");
+        queue(first);
+        service.sweep();
+        String matchId = instance.matchId;
+        queue(second);
+        sweepWithoutNetwork(2);
+        assertEquals(1, instances().size());
+        assertEquals(1, instance.roster.size());
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        sweepWithoutNetwork(2);
+        assertEquals(1, instance.roster.size(), "Paper alone cannot open admission");
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1));
+        sweepWithoutNetwork(2);
+        assertEquals(1, instance.roster.size(), "Velocity alone cannot open admission");
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        service.sweep();
+        assertEquals(2, instance.roster.size());
+        assertEquals(2, instance.rosterVersion);
+        assertEquals(matchId, instance.matchId);
+        assertEquals("running", instance.state);
+        assertTrue(instance.transferPending);
+        assertEquals(List.of(second.getUniqueId()), instance.pendingTransfers);
+        assertEquals(List.of(first.getUniqueId()), transfers);
+        assertEquals(2, persisted().get(0).roster.size());
+        queue(third);
+        sweepWithoutNetwork(2);
+        assertEquals(1, instances().size());
+        assertEquals(2, instance.roster.size());
+        service.report(instance, versionedReport(instance, "running", 1, first, second));
+        service.report(instance, report("running", matchId, first, second));
+        assertEquals(1, transfers.size());
+        JsonObject fullRoster = service.report(instance, versionedReport(instance, "running", 1, first));
+        assertEquals(2, fullRoster.getAsJsonArray("roster").size());
+        assertEquals(2, fullRoster.get("rosterVersion").getAsInt());
+        assertFalse(fullRoster.has("commands"));
+        service.report(instance, versionedReport(instance, "running", 2, first));
+        assertEquals(List.of(first.getUniqueId(), second.getUniqueId()), transfers);
+        assertTrue(instance.pendingTransfers.isEmpty());
+        service.report(instance, versionedReport(instance, "running", 2, first));
+        assertEquals(2, transfers.size());
+        sweepWithoutNetwork(1);
+        assertEquals(2, instance.roster.size());
+        occupants.add(second);
+        service.report(instance, versionedReport(instance, "running", 2, first, second));
+        service.sweep();
+        assertEquals(3, instance.rosterVersion);
+        assertEquals(3, instance.roster.size());
+        assertEquals(List.of(third.getUniqueId()), instance.pendingTransfers);
+        assertEquals(1, instances().size());
+    }
+
+    @Test
+    void nativeFfaAdditionsKeepPartiesAtomicAndNeverExceedTheCap() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player first = player("First");
+        queue(first);
+        service.sweep();
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        Player[] party = party(3);
+        queue(party[0]);
+        service.sweep();
+        assertEquals(4, instance.roster.size());
+        assertEquals(2, instance.groups.size());
+        assertEquals(3, instance.groups.get(1).players().size());
+        assertTrue(instance.roster.stream().allMatch(member -> member.team().isEmpty()));
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        assertEquals(1, transfers.size());
+        service.report(instance, versionedReport(instance, "running", 2, first));
+        assertEquals(4, transfers.size());
+        occupants.addAll(List.of(party));
+        service.report(instance, versionedReport(instance, "running", 2, occupants.toArray(Player[]::new)));
+        queue(player("Overflow"));
+        sweepWithoutNetwork(2);
+        assertEquals(4, instance.roster.size());
+        assertEquals(2, instances().size(), "A full lobby can create another instance within the cap");
+        assertEquals(1, queue().size());
+        Player[] oversized = party(5);
+        queue(oversized[0]);
+        assertEquals(1, queue().size());
+    }
+
+    @Test
+    void nativeTeamfulAdditionsUseExistingCountsRatherThanOverfillATeam() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, false));
+        Player first = player("First");
+        Player second = player("Second");
+        queue(first);
+        queue(second);
+        service.sweep();
+        assertEquals(List.of("red", "blue"), instance.roster.stream().map(Minigames.Member::team).toList());
+        occupants.addAll(List.of(first, second));
+        service.report(instance, versionedReport(instance, "running", 1, first, second));
+        Player[] blocked = party(2);
+        Player solo = player("Solo");
+        queue(blocked[0]);
+        queue(solo);
+        service.sweep();
+        assertEquals(3, instance.roster.size());
+        assertEquals("red", instance.roster.get(2).team());
+        assertEquals(solo.getUniqueId().toString(), instance.roster.get(2).uuid());
+        assertEquals(1, queue().size());
+        assertEquals(parties.members(blocked[0].getUniqueId()), queue().get(0).players());
+    }
+
+    @Test
+    void nativeVersionMustBeANonnegativeBoundedIntegerAndMalformedHttpDoesNotMutate() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        queue(player("Solo"));
+        service.sweep();
+        long heartbeat = instance.heartbeat;
+        clock.incrementAndGet();
+        for (String value : List.of("null", "\"1\"", "true", "-1", "2", "1.5", "2147483648", "{}", "[]")) {
+            JsonObject report = report("running", instance.matchId);
+            report.add("rosterVersion", JsonParser.parseString(value));
+            assertEquals(400, http("POST", "arena", "Bearer " + TOKEN, report).status(), value);
+            assertEquals(heartbeat, instance.heartbeat, value);
+            assertTrue(instance.transferPending, value);
+            assertTrue(transfers.isEmpty(), value);
+        }
+        JsonObject stale = versionedReport(instance, "running", 0);
+        assertEquals(200, http("POST", "arena", "Bearer " + TOKEN, stale).status());
+        assertTrue(instance.transferPending);
+        assertEquals(200, http("POST", "arena", "Bearer " + TOKEN, versionedReport(instance, "running", 1)).status());
+        assertEquals(1, transfers.size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativeAdditionalAckAndJoinTimeoutsEndTheWholeLobbyAndRequeueIntactGroups(boolean acknowledge) throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player first = player("First");
+        queue(first);
+        service.sweep();
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        Player[] additions = party(2);
+        queue(additions[0]);
+        service.sweep();
+        assertEquals("running", instance.state);
+        assertEquals(clock.get() + 10000, instance.deadline);
+        if (acknowledge) {
+            service.report(instance, versionedReport(instance, "running", 2, first));
+        }
+        occupants.clear();
+        List<Matchmaker.Group> original = instance.groups;
+        clock.set(instance.deadline);
+        sweepWithoutNetwork(1);
+        assertEquals("ending", instance.state);
+        assertEquals(original, queue());
+        sweepWithoutNetwork(1);
+        assertEquals(original, queue());
+        assertEquals(acknowledge ? 3 : 1, transfers.size());
+    }
+
+    @Test
+    void nativeInitialAckTimeoutRequeuesButChangedPartiesDoNot() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player[] players = party(3);
+        queue(players[0]);
+        service.sweep();
+        assertEquals(3, instance.roster.size());
+        parties.leave(players[1].getUniqueId());
+        clock.set(instance.deadline);
+        sweepWithoutNetwork(1);
+        assertEquals("ending", instance.state);
+        assertTrue(queue().isEmpty());
+        assertTrue(transfers.isEmpty());
+    }
+
+    @Test
+    void nativePendingJoinsAreNotEndedByEmptyGraceButEndSignalsStillWork() throws Exception {
+        JsonObject manifest = lobbyManifest(true, true);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.getAsJsonObject("lifecycle").getAsJsonObject("end").addProperty("whenEmpty", true);
+        manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
+        Minigames.Instance instance = ready(manifest);
+        queue(player("Solo"));
+        service.sweep();
+        service.report(instance, versionedReport(instance, "running", 1));
+        sweepWithoutNetwork(1);
+        clock.addAndGet(1001);
+        sweepWithoutNetwork(1);
+        assertEquals("running", instance.state);
+        assertEquals(0, instance.emptySince);
+        service.report(instance, versionedReport(instance, "ended", 1));
+        assertEquals("ending", instance.state);
+        assertTrue(queue().isEmpty());
+    }
+
+    @Test
+    void nativeAdmissionStopsAfterAReportedOrProxyRosterDeparture() throws Exception {
+        Minigames.Instance instance = ready(lobbyManifest(true, true));
+        Player first = player("First");
+        queue(first);
+        service.sweep();
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1, first));
+        queue(player("Second"));
+        occupants.clear();
+        service.sweep();
+        assertEquals(1, instance.roster.size());
+        occupants.add(first);
+        service.report(instance, versionedReport(instance, "running", 1));
+        service.sweep();
+        assertEquals(1, instance.roster.size());
+    }
+
+    @Test
+    void rejectedTransferLogsStatusAndRedactedReasonAndNotifiesPlayer() throws Exception {
+        Minigames.Instance instance = ready();
+        instance.matchId = UUID.randomUUID().toString();
+        Player player = player("Rejected");
+        ConnectionRequestBuilder.Result result = new ConnectionRequestBuilder.Result() {
+            @Override
+            public ConnectionRequestBuilder.Status getStatus() {
+                return ConnectionRequestBuilder.Status.SERVER_DISCONNECTED;
+            }
+
+            @Override
+            public Optional<Component> getReasonComponent() {
+                return Optional.of(Component.text("whitelist denied vmc_" + TOKEN));
+            }
+
+            @Override
+            public RegisteredServer getAttemptedConnection() {
+                return target;
+            }
+        };
+        assertFalse(result.isSuccessful());
+        doReturn(connection(() -> CompletableFuture.completedFuture(result)))
+                .when(player).createConnectionRequest(target);
+
+        assertDoesNotThrow(() -> connect(instance, player));
+
+        var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(logger).warn(eq("Minigame transfer rejected template={} instanceId={} matchId={} player={} reason={}"), args.capture());
+        Object[] warning = args.getValue();
+        assertEquals(List.of("Arena", instance.serverId, instance.matchId, player.getUniqueId()),
+                List.of(warning[0], warning[1], warning[2], warning[3]));
+        String reason = warning[4].toString();
+        assertTrue(reason.startsWith("SERVER_DISCONNECTED: "));
+        assertTrue(reason.contains("whitelist denied"));
+        assertTrue(reason.contains("[redacted]"));
+        assertFalse(java.util.Arrays.toString(warning).contains(TOKEN));
+        verifyTransferFailureMessage(player);
+        verify(logger, never()).info(contains("transfer connected"), any(Object[].class));
+    }
+
+    @Test
+    void exceptionalTransferFutureLogsExceptionClassAndNotifiesPlayer() throws Exception {
+        Minigames.Instance instance = ready();
+        instance.matchId = UUID.randomUUID().toString();
+        Player player = player("Exceptional");
+        CompletableFuture<ConnectionRequestBuilder.Result> future = new CompletableFuture<>();
+        doReturn(connection(() -> future)).when(player).createConnectionRequest(target);
+
+        assertDoesNotThrow(() -> connect(instance, player));
+        verify(logger, never()).warn(contains("Minigame transfer"), any(Object[].class));
+        verify(player, never()).sendMessage(any(Component.class));
+        assertTrue(future.completeExceptionally(new IllegalStateException("whitelist " + TOKEN)));
+
+        var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(logger).warn(eq("Minigame transfer rejected template={} instanceId={} matchId={} player={} reason={}"), args.capture());
+        assertEquals(List.of("Arena", instance.serverId, instance.matchId, player.getUniqueId(), "IllegalStateException"),
+                List.of(args.getValue()));
+        assertFalse(java.util.Arrays.toString(args.getValue()).contains(TOKEN));
+        verifyTransferFailureMessage(player);
+        verify(logger, never()).info(contains("transfer connected"), any(Object[].class));
+    }
+
+    @Test
+    void synchronousTransferFailureLogsExceptionClassAndRedactedDetail() throws Exception {
+        Minigames.Instance instance = ready();
+        Player player = player("Synchronous");
+        doReturn(connection(() -> {
+            throw new IllegalArgumentException("whitelist unavailable vmc_" + TOKEN);
+        })).when(player).createConnectionRequest(target);
+
+        assertDoesNotThrow(() -> connect(instance, player));
+
+        var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(logger).warn(eq("Minigame transfer failed template={} instanceId={} player={} error={}: {}"), args.capture());
+        assertEquals(List.of("Arena", instance.serverId, player.getUniqueId(), "IllegalArgumentException",
+                "whitelist unavailable [redacted]"), List.of(args.getValue()));
+        assertFalse(java.util.Arrays.toString(args.getValue()).contains(TOKEN));
+        verify(logger, never()).info(contains("transfer connected"), any(Object[].class));
+    }
+
+    private ConnectionRequestBuilder connection(
+            java.util.function.Supplier<CompletableFuture<ConnectionRequestBuilder.Result>> result) {
+        return (ConnectionRequestBuilder) Proxy.newProxyInstance(ConnectionRequestBuilder.class.getClassLoader(),
+                new Class<?>[]{ConnectionRequestBuilder.class}, (receiver, method, arguments) -> {
+                    if (method.getName().equals("connect")) {
+                        return result.get();
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private void connect(Minigames.Instance instance, Player player) throws Exception {
+        var connect = Minigames.class.getDeclaredMethod("connect", Minigames.Instance.class,
+                Player.class, RegisteredServer.class);
+        connect.setAccessible(true);
+        connect.invoke(service, instance, player, target);
+    }
+
+    private void verifyTransferFailureMessage(Player player) {
+        verify(player).sendMessage(Component.text("Could not join the minigame. Check with an administrator; the match join timeout still applies."));
+    }
+
+    @Test
+    void safeFailureRedactsSecretsNormalizesControlsAndBoundsOutput() {
+        assertEquals("No error detail available", Minigames.safeFailure(new java.io.IOException()));
+        String message = Minigames.safeFailure(new java.io.IOException("HTTP 503\r\nvmc_" + TOKEN
+                + "\t" + TOKEN.toUpperCase() + "\u001b" + "x".repeat(600)));
+        assertEquals(512, message.length());
+        assertTrue(message.startsWith("HTTP 503  [redacted] [redacted] "));
+        assertFalse(message.contains(TOKEN));
+        assertFalse(message.contains("\n"));
+        assertFalse(message.contains("\u001b"));
+    }
+
+    @Test
+    void preparationFailureLogsExceptionClassAndSafeApiStatusWithoutRawResponse() throws Exception {
+        Minigames.Instance instance = provisioning();
+        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        api.createContext("/api/minecraft/v1/instances", exchange -> {
+            byte[] body = ("{\"message\":\"" + TOKEN + "\"}").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(400, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        api.start();
+        try {
+            Files.writeString(directory.resolve("vestri-dynamic-config.json"),
+                    "{\"backendUrl\":\"http://127.0.0.1:" + api.getAddress().getPort()
+                    + "\",\"templates\":{\"Arena\":\"vmc_" + TOKEN + "\"}}");
+            var provision = Minigames.class.getDeclaredMethod("provision", Minigames.Instance.class);
+            provision.setAccessible(true);
+            provision.invoke(service, instance);
+            var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+            verify(logger).warn(eq("Minigame preparation pending template={} requestId={} error={}: {}; the same request will be retried"), args.capture());
+            assertEquals("APIException", args.getValue()[2]);
+            assertTrue(args.getValue()[3].toString().contains("HTTP 400"));
+            assertFalse(args.getValue()[3].toString().contains(TOKEN));
+            assertEquals("provisioning", instance.state);
+        } finally {
+            api.stop(0);
+        }
+    }
+
+    @Test
+    void malformedSuccessfulSpawnResponseIsLoggedAndRetriedWithTheSameRequestId() throws Exception {
+        Minigames.Instance instance = provisioning();
+        List<String> requests = new ArrayList<>();
+        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        api.createContext("/api/minecraft/v1/instances", exchange -> {
+            requests.add(JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8))
+                    .getAsJsonObject().get("requestId").getAsString());
+            byte[] body = "{\"serverId\":\"invalid\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        api.start();
+        try {
+            Files.writeString(directory.resolve("vestri-dynamic-config.json"),
+                    "{\"backendUrl\":\"http://127.0.0.1:" + api.getAddress().getPort()
+                    + "\",\"templates\":{\"Arena\":\"vmc_" + TOKEN + "\"}}");
+            var provision = Minigames.class.getDeclaredMethod("provision", Minigames.Instance.class);
+            provision.setAccessible(true);
+            provision.invoke(service, instance);
+            provision.invoke(service, instance);
+            assertEquals(List.of(instance.requestId, instance.requestId), requests);
+            assertEquals("provisioning", instance.state);
+            var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+            verify(logger, times(2)).warn(eq("Minigame preparation pending template={} requestId={} error={}: {}; the same request will be retried"), args.capture());
+            assertEquals("IllegalArgumentException", args.getValue()[2]);
+            assertEquals("Invalid UUID string: invalid", args.getValue()[3]);
+        } finally {
+            api.stop(0);
+        }
+    }
+
+    @Test
+    void startupStallWarningIsOnceAfter30SecondsAndIncludesIdentityAndDnsAdvice() throws Exception {
+        Minigames.Instance instance = provisioning();
+        clock.addAndGet(29999);
+        sweepWithoutNetwork(1);
+        verifyNoInteractions(logger);
+        clock.incrementAndGet();
+        sweepWithoutNetwork(3);
+        var args = org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(logger, times(1)).warn(contains("no agent report after 30s"), args.capture());
+        assertEquals(List.of("Arena", SERVER_ID, instance.requestId), List.of(args.getValue()));
+        assertFalse(instance.state.equals("ending"));
+        assertTrue(instance.startupWarned);
+        service.report(instance, report("ready", null));
+        clock.addAndGet(30000);
+        sweepWithoutNetwork(1);
+        verify(logger, times(1)).warn(contains("proxy DNS"), any(Object[].class));
+    }
+
+    private Player[] party(int size) {
+        Player[] players = java.util.stream.IntStream.range(0, size)
+                .mapToObj(index -> player("Party" + index)).toArray(Player[]::new);
+        for (int index = 1; index < size; index++) {
+            parties.invite(players[0].getUniqueId(), players[index].getUniqueId(), clock.get());
+            parties.accept(players[index].getUniqueId(), players[0].getUniqueId(), clock.get());
+        }
+        return players;
+    }
+
+    private JsonObject versionedReport(Minigames.Instance instance, String state, int version, Player... players) {
+        JsonObject report = report(state, instance.matchId, players);
+        report.addProperty("rosterVersion", version);
+        return report;
+    }
+
+    private JsonObject lobbyManifest(boolean nativeLobby, boolean teamfree) {
+        JsonObject manifest = manifest(null);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        if (nativeLobby) {
+            spec.addProperty("lobbyMode", "plugin");
+        }
+        if (teamfree) {
+            spec.remove("teams");
+            spec.addProperty("teamSize", 0);
+        }
+        manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
+        return manifest;
+    }
 
     @AfterEach
     void close() {
@@ -880,8 +1634,18 @@ class MinigamesTest {
     }
 
     private Minigames.Instance ready() throws Exception {
+        return ready(null);
+    }
+
+    private Minigames.Instance ready(JsonObject manifest) throws Exception {
         configure("Arena");
-        Minigames.Instance instance = provisioning();
+        Minigames.Instance instance;
+        if (manifest == null) {
+            instance = provisioning();
+        } else {
+            start(manifest);
+            instance = instances().get(0);
+        }
         service.report(instance, report("ready", null));
         target = mock(RegisteredServer.class);
         when(target.getServerInfo()).thenReturn(new ServerInfo("Arena-1", new InetSocketAddress("127.0.0.1", 25565)));
@@ -924,7 +1688,16 @@ class MinigamesTest {
                 (ignored, method, arguments) -> {
                     if (method.getName().equals("connect")) {
                         transfers.add(id);
-                        return CompletableFuture.completedFuture(null);
+                        ConnectionRequestBuilder.Result result = (ConnectionRequestBuilder.Result) Proxy.newProxyInstance(
+                                ConnectionRequestBuilder.Result.class.getClassLoader(),
+                                new Class<?>[]{ConnectionRequestBuilder.Result.class}, (receiver, called, values) -> switch (called.getName()) {
+                                    case "isSuccessful" -> true;
+                                    case "getStatus" -> ConnectionRequestBuilder.Status.SUCCESS;
+                                    case "getReasonComponent" -> Optional.empty();
+                                    case "getAttemptedConnection" -> target;
+                                    default -> throw new UnsupportedOperationException(called.getName());
+                                });
+                        return CompletableFuture.completedFuture(result);
                     }
                     throw new UnsupportedOperationException(method.getName());
                 });
@@ -1039,7 +1812,7 @@ class MinigamesTest {
     }
 
     private void start(JsonObject manifest) throws Exception {
-        service = new Minigames(proxy, parties, directory, mock(Logger.class), clock::get);
+        service = new Minigames(proxy, parties, directory, logger, clock::get);
         service.synchronize(manifest);
         instances().forEach(instance -> instance.busy = true);
     }

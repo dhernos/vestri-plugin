@@ -9,27 +9,40 @@ import java.util.regex.Pattern;
 
 record MinigameSpec(List<String> teams, int teamSize, int minPlayers, int maxPlayers,
                     long joinTimeout, int readyServers, int maxInstances, boolean whenEmpty,
-                    long emptyGrace, String fallback) {
+                    long emptyGrace, String fallback, String lobbyMode) {
+    boolean teamfree() {
+        return teams.isEmpty();
+    }
+
+    boolean nativeLobby() {
+        return lobbyMode.equals("plugin");
+    }
+
     static MinigameSpec parse(JsonObject json) {
         List<String> teams = new ArrayList<>();
-        json.getAsJsonArray("teams").forEach(team -> teams.add(team.getAsString()));
-        int teamSize = json.get("teamSize").getAsInt();
+        if (json.has("teams") && !json.get("teams").isJsonNull()) {
+            json.getAsJsonArray("teams").forEach(team -> teams.add(team.getAsString()));
+        }
+        int teamSize = json.has("teamSize") ? json.get("teamSize").getAsInt() : 0;
+        String lobbyMode = json.has("lobbyMode") ? json.get("lobbyMode").getAsString() : "vestri";
         int minimum = json.get("minPlayers").getAsInt();
         int maximum = json.get("maxPlayers").getAsInt();
         int ready = json.get("readyServers").getAsInt();
         int limit = json.get("maxInstances").getAsInt();
         JsonObject end = json.getAsJsonObject("lifecycle").getAsJsonObject("end");
         String fallback = end.get("returnPlayersTo").getAsString();
-        if (teams.isEmpty() || teams.size() > 100 || new HashSet<>(teams).size() != teams.size()
+        if (teams.size() > 100 || new HashSet<>(teams).size() != teams.size()
                 || teams.stream().anyMatch(team -> !team.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}"))
-                || teamSize < 1 || teamSize > 100 || minimum < 1 || minimum > maximum || maximum > 100
-                || maximum > teams.size() * teamSize || limit < 1 || limit > 100 || ready < 0 || ready > limit
+            || teamSize < 0 || teamSize > 100 || !teams.isEmpty() && (teamSize < 1 || maximum > teams.size() * teamSize)
+            || !List.of("vestri", "plugin").contains(lobbyMode)
+            || minimum < 1 || minimum > maximum || maximum > 100
+            || limit < 1 || limit > 100 || ready < 0 || ready > limit
                 || !fallback.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}") || !end.get("deleteServer").getAsBoolean()) {
             throw new IllegalArgumentException("Invalid minigame template settings");
         }
         return new MinigameSpec(List.copyOf(teams), teamSize, minimum, maximum,
                 duration(json.get("joinTimeout").getAsString()), ready, limit,
-                end.get("whenEmpty").getAsBoolean(), duration(end.get("emptyGrace").getAsString()), fallback);
+                end.get("whenEmpty").getAsBoolean(), duration(end.get("emptyGrace").getAsString()), fallback, lobbyMode);
     }
 
     static long duration(String text) {

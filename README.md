@@ -164,7 +164,8 @@ not covered by player-event retention and require their own retention policy.
   ordinary servers such as a manually configured lobby alone.
 
 The backend writes the manifest and the worker triggers synchronization. The
-plugin does not balance players. Plain spawn commands do not
+plugin does not balance players for ordinary templates; minigame matchmaking
+and roster assignment are described separately below. Plain spawn commands do not
 wait for readiness or move players; the optional `--send-player` flag waits for
 a Minecraft status ping and connects the selected player to that exact instance.
 Player-owned instances additionally have automatic empty-server maintenance and
@@ -235,8 +236,10 @@ still obey configuration and per-user limits.
   is stopped when empty, but its files and registration remain. Joining through
   `/vestriservers join` or attempting an ordinary Velocity connection to that
   backend starts it again and uses the existing readiness wait and transfer.
-  Ordinary connection attempts can wake it for any player; listing, explicit
-  join commands, pause changes, and deletion remain owner-scoped. Normal backend
+  Ordinary connection attempts enforce the owned-server ACL: only the owner,
+  an invited player where supported, or an admin with join access can wake it.
+  Listing and explicit joins follow owned/invited/admin access; pause changes
+  and deletion remain owner-scoped. Normal backend
   whitelist and access rules still apply. Pause stays enabled after joining,
   so the next empty period stops the server again rather than deleting it.
   Pausing a pending-deletion server cancels its deadline and keeps it stopped.
@@ -416,7 +419,7 @@ recreated. The new backend and proxy JAR must be deployed together.
 ## Install and configure
 
 Build from this directory with `mvn clean package`. Install
-`target/vestri-dynamic-servers-1.0.0.jar` in the proxy's `plugins` directory and
+`target/vestri-dynamic-servers-1.1.0.jar` in the proxy's `plugins` directory and
 restart the proxy to load the updated plugin.
 
 In Vestri's node Minecraft library, create a saved dynamic server template linked
@@ -585,9 +588,10 @@ failure, not a missing player command permission. Owned console spawns and
 `/vestriservers retry` use the same API and saved request UUID; a successful
 manual retry can indicate a transient failure that cleared between attempts.
 
-`VESTRI_DYNAMIC_SYNC_OK` alone does not mean spawning succeeded: the backend
-checks the proxy bridge before copying a template and synchronizes it again
-after starting the new instance. Check the final API error for the failing
+`VESTRI_DYNAMIC_SYNC_OK` confirms manifest synchronization only, not a successful
+spawn or Minecraft readiness. It can come from the preflight proxy-bridge check
+before copying a template; synchronization also runs after starting the new
+instance. Check the final API error for the failing
 operation and correlate the proxy's `Vestri spawn diagnostic` request UUID with
 backend/worker logs from the same time. Backend `post_commit_failure` records
 identify `stage=start` or `stage=reload` for failures after the instance is saved.
@@ -760,7 +764,10 @@ Grant the exact Velocity permission `vestri.minigames` to every participant.
 The party leader queues or leaves for the whole group; a player without a party
 queues as a one-player group. `/minigame join <template>` takes a template, **not
 a player argument**. All members must be connected, permitted, and neither queued
-nor playing elsewhere. Parties must fit within `teamSize` and `maxPlayers`.
+nor playing elsewhere. With configured teams, parties must fit within both
+`teamSize` and `maxPlayers`.
+When teams are omitted, `null`, or empty, the match is team-free (FFA):
+`teamSize` is not required, and whole parties need only fit within `maxPlayers`.
 Changing membership or disconnecting invalidates that group's queued entry;
 the remaining players must queue again. `/minigame leave` withdraws a queue entry
 or cancels a match still joining/starting, not a running game's gameplay session.
@@ -768,7 +775,7 @@ or cancels a match still joining/starting, not a running game's gameplay session
 ### Template Settings and Startup Commands
 
 Create or edit a saved template in the dashboard's **minigame mode**, linked to
-the intended Velocity proxy. Configure teams, player limits, the ready-server
+the intended Velocity proxy. Configure optional teams, player limits, the ready-server
 pool, readiness, startup actions, and end behavior there. Minigame templates are
 discovered through the backend-generated proxy manifest, including templates
 with no instances yet. API keys are still configured **manually**: issue a
@@ -788,6 +795,7 @@ references when applying them:
 mode: minigames
 maxInstances: 4
 minigame:
+  lobbyMode: vestri
   teams: [red, blue]
   teamSize: 2
   minPlayers: 2
@@ -820,19 +828,70 @@ An action without `forEach` runs once and can use `{matchId}`. `forEach: team`
 runs once per configured team and can also use `{team}`. `forEach: player` runs
 once per roster player and can use `{player}`, `{uuid}`, and `{team}` as well as
 `{matchId}`. Here `{player}` is the roster's Minecraft name, not an NPC placeholder.
-The proxy precomputes team assignments while preserving whole parties on one
+For team-based matches, the proxy precomputes assignments while preserving whole parties on one
 team; the per-player action uses that assignment, rather than choosing teams
 again on Paper. `{player}` and `{uuid}` are invalid outside player scope, and
 `{team}` requires team or player scope.
 
-Startup actions run only after the entire assigned roster has joined. Actions
+Teams are optional. Omit `teams` or use `teams: []` for FFA and omit `teamSize`.
+Team-scoped actions and `{team}` placeholders require configured teams; player
+actions without `{team}` remain usable in a Vestri-managed FFA match.
+
+`lobbyMode` defaults to `vestri`, preserving the existing managed lifecycle:
+the queue waits for `minPlayers`, assigns a roster, waits for all players to
+join, and dispatches startup actions before marking the match running.
+Use `lobbyMode: plugin` when the installed gameplay plugin owns its native lobby,
+countdown, teams, and game state. This mode bypasses Vestri's `minPlayers`
+queue threshold and startup commands; `lifecycle.onAllJoined` **must be empty**.
+Player bounds and `maxPlayers` still apply. For example, a minimal team-free
+native lobby with an explicit end signal is:
+
+```yaml
+mode: minigames
+maxInstances: 4
+minigame:
+  lobbyMode: plugin
+  teams: []
+  minPlayers: 1
+  maxPlayers: 8
+  joinTimeout: 20s
+  readyServers: 1
+  lifecycle:
+    ready:
+      trigger: serverLoad
+    onAllJoined: []
+    end:
+      returnPlayersTo: lobby
+      deleteServer: true
+```
+
+The gameplay plugin or its adapter issues `vestridynamic end` when the game ends.
+Use explicit readiness instead of `serverLoad` if plugin initialization needs it.
+
+Native lobbies accept incremental whole-party admissions into an existing match,
+subject to `maxPlayers` and any configured team capacities. Each addition is a
+full-roster atomic update with an incremented `rosterVersion`; Paper must apply
+the allowed roster and acknowledge the matching match ID and version before
+Velocity transfers the newly admitted players. Existing players are not sent
+again, and pending admissions must finish before another roster addition.
+The initial acknowledgement enters running state without a Vestri startup phase;
+later admissions remain in that state. `joinTimeout` bounds acknowledgement and
+joining, with cancellation/cleanup on failure.
+
+Vestri does not impose an explicit game-start admission lock in plugin mode.
+The gameplay plugin controls whether its game state permits a join, including
+kicking or rejecting admitted players under its own restrictions. Roster
+authorization and a version acknowledgement are not promises of gameplay
+acceptance. The Vestri-managed lifecycle is unchanged.
+
+In Vestri-managed mode, startup actions run only after the entire assigned roster has joined. Actions
 and their repetitions are dispatched in configured order; a rejected command
 fails startup and stops later commands. **Command ordering is not an asynchronous
 completion guarantee**: a command returning successfully can still have work in
 flight. Use a gameplay-plugin adapter or explicit signal when initialization must
 finish before the next phase, rather than assuming sequential commands await it.
 
-`joinTimeout` is the maximum roster-join wait after the server acknowledges its
+In Vestri-managed mode, `joinTimeout` is the maximum roster-join wait after the server acknowledges its
 assignment. A no-show or joining/starting timeout cancels the match, returns
 present players, and schedules instance cleanup. Only intact groups whose exact
 membership is still connected and permitted are automatically requeued; a group
@@ -898,6 +957,36 @@ servers to load it. Updating only Velocity is insufficient; existing template
 JARs must also be updated so newly generated instances have the agent. Maintain
 the manually configured template keys so provisioning and cleanup remain usable.
 
+Templates and provisioning jobs retain saved configuration snapshots; changing
+the template does not rewrite an old job or automatically upgrade a current
+match instance. For recovery, upgrade the backend, Velocity, and Paper template
+JARs together, then stop and recreate old matches through operator-managed
+evacuation and cleanup. Retain the original request UUID after preparation
+failure so retries reconcile the same instance. Do not manually delete either
+ledger to force provisioning or bypass an execution fence.
+
+### Preparation and Agent Diagnostics
+
+Correlate Velocity's `Minigame preparation pending` log by template and
+`requestId` with backend/worker logs. It reports the exception class and a
+redacted message and retains the same request for retry. An `IOException` alone
+does not identify the live failure's root cause; a preflight
+`VESTRI_DYNAMIC_SYNC_OK` is manifest-only confirmation, not spawn readiness.
+
+Check Paper's startup configuration log to confirm the minigame agent loaded its
+generated configuration. Missing or invalid configuration/execution fences are
+reported separately and deny entry. `Minigame control unavailable` reports an
+HTTP status or transport/response exception class without credentials or response
+bodies; repeated warnings are rate-limited to once per 30 seconds, and recovery
+is logged. Velocity's `Minigame startup stalled` warning means no agent report
+arrived after 30 seconds: inspect Paper startup and agent configuration, then
+verify private proxy DNS and port 25580 reachability from that instance.
+Connection-result/reason diagnostics are being added on `main`; when available
+in the deployed build, use them to distinguish failed transfers from a gameplay
+plugin's login rejection. Do not infer a successful connection from a roster
+acknowledgement alone. These diagnostics do not establish that the root cause
+of an uncorrelated live preparation error has been fixed.
+
 The proxy's private control HTTP listener binds port **25580**. Allow generated
 Paper instances to reach it on the private Docker network, but **do not publicly
 publish this port**, add public reverse-proxy routing, or expose it to players.
@@ -905,10 +994,10 @@ Generated per-instance bearer tokens authorize the bound server/slug; they are
 not player credentials, template API keys, or the console bridge secret.
 Protect the generated config and proxy manifest as secrets.
 
-Currently the generated `controlUrl` uses `http://vestri-<parent Docker root>:25580`
-for the parent proxy. Check that this alias resolves to the proxy container from
-the match containers; do not assume a separate `main` alias is already used. A
-later backend change may use a corrected main-container alias. This address is
+The generated `controlUrl` uses the private proxy-container hostname
+`http://vestri-<parent Docker root>:25580`, which is valid in the shipped Compose
+configuration. Verify that the generated hostname resolves to the proxy container
+and that HTTP is reachable from the match container on your deployment. This is
 private agent-to-proxy HTTP, distinct from `backendUrl` and the Minecraft port.
 
 This section documents the implementation and deployment requirements, not a

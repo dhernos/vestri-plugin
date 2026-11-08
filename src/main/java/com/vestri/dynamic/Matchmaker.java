@@ -19,12 +19,28 @@ final class Matchmaker {
     record Match(List<Group> groups, Map<UUID, String> teams) {}
 
     static Match select(List<Group> queue, List<String> teams, int teamSize, int minimum, int maximum) {
+        return select(queue, teams, teamSize, minimum, maximum, Map.of());
+    }
+
+    static Match select(List<Group> queue, List<String> teams, int teamSize, int minimum, int maximum,
+                        Map<UUID, String> existing) {
         int[] counts = new int[teams.size()];
+        existing.values().forEach(team -> {
+            int index = teams.indexOf(team);
+            if (index >= 0) {
+                counts[index]++;
+            }
+        });
         List<Group> selected = new ArrayList<>();
         Map<UUID, String> assignments = new LinkedHashMap<>();
         for (Group group : queue) {
-            if (assignments.size() + group.players.size() > maximum
-                    || group.players.stream().anyMatch(assignments::containsKey)) {
+            if (existing.size() + assignments.size() + group.players.size() > maximum
+                    || group.players.stream().anyMatch(player -> assignments.containsKey(player) || existing.containsKey(player))) {
+                continue;
+            }
+            if (teams.isEmpty()) {
+                group.players.forEach(player -> assignments.put(player, ""));
+                selected.add(group);
                 continue;
             }
             int best = -1;

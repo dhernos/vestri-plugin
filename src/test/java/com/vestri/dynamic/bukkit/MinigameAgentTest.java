@@ -20,6 +20,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -294,7 +299,7 @@ class MinigameAgentTest {
                                         () -> MinigameAgent.configuration(text.replace("start {matchId}", command)));
                 }
                 assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(text.replace("finished", "end\\nround")));
-                assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(text.replace("[\"red\",\"blue\"]", "[]")));
+                assertEquals(List.of(), MinigameAgent.configuration(text.replace("[\"red\",\"blue\"]", "[]")).teams());
                 var many = com.google.gson.JsonParser.parseString(text).getAsJsonObject();
                 var actions = many.getAsJsonObject("spec").getAsJsonObject("lifecycle").getAsJsonArray("onAllJoined");
                 var action = actions.get(0).deepCopy();
@@ -345,6 +350,172 @@ class MinigameAgentTest {
     }
 
     @Test
+    void teamFreeConfigurationAndPlayerActionsRequireNoTeam() {
+        String text = config("http://vestri-proxy-123:25580");
+        for (String teams : List.of("\"teams\":[],", "\"teams\":null,", "")) {
+            String ffa = text.replace("\"teams\":[\"red\",\"blue\"],", teams)
+                    .replace("{\"command\":\"start {matchId}\"}",
+                            "{\"command\":\"assign {player} {uuid} {matchId}\",\"forEach\":\"player\"}");
+            var parsed = MinigameAgent.configuration(ffa);
+            var roster = MinigameAgent.control("{\"state\":\"starting\",\"matchId\":\"" + match
+                    + "\",\"roster\":[{\"uuid\":\"" + match + "\",\"name\":\"Player\",\"team\":\"\"}]}", parsed.teams()).roster();
+            assertEquals(List.of("assign Player " + match + " " + match),
+                    MinigameAgent.expand(parsed.actions(), parsed.teams(), roster, match));
+            assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(ffa.replace("{uuid}", "{team}")));
+            assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(ffa
+                    .replace("assign {player} {uuid} {matchId}", "start {matchId}").replace("\"player\"", "\"team\"")));
+        }
+        String body = "{\"state\":\"starting\",\"matchId\":\"" + match + "\",\"roster\":["
+                + "{\"uuid\":\"" + match + "\",\"name\":\"Player\",\"team\":\"\"}]}";
+        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.control(body, List.of("red")));
+        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.control(body.replace("\"team\":\"\"", "\"team\":\"red\""), List.of()));
+    }
+
+    @Test
+        void nativeLobbyAdmitsIncrementalRosterWithoutStartupAndFailsOnRestart() throws Exception {
+                var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
+                var first = new MinigameAgent.Member(match, "Player", "red");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
+                Path path = data.resolve("native.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.apply(new MinigameAgent.Control("joining", match, List.of(first), 1), Set.of(),
+                                        command -> fail("Native must never dispatch"));
+                        assertEquals("joining", status(agent));
+                        assertFalse(agent.allows(match));
+                        assertTrue(new MinigameAgent.MatchFence(path, config.teams(), "plugin").startupClaimed());
+                        agent.ready();
+                        assertEquals("running", status(agent));
+                        assertTrue(agent.allows(match));
+                        agent.apply(new MinigameAgent.Control("joining", match, List.of(first, second), 2), Set.of(),
+                                        command -> fail("No all-online or starting gate"));
+                        assertTrue(agent.allows(second.uuid()));
+                        assertEquals(2, reportVersion(agent));
+                        var durable = new MinigameAgent.MatchFence(path, config.teams(), "plugin");
+                        assertEquals(List.of(first, second), durable.roster());
+                        assertEquals(2, durable.rosterVersion());
+                        for (var invalid : List.of(
+                                        new MinigameAgent.Control("running", match, List.of(first), 3),
+                                        new MinigameAgent.Control("running", match, List.of(first), 1),
+                                        new MinigameAgent.Control("running", UUID.randomUUID(), List.of(first, second), 3),
+                                        new MinigameAgent.Control("running", match, List.of(first,
+                                                        new MinigameAgent.Member(second.uuid(), "Renamed", "blue")), 3),
+                                        new MinigameAgent.Control("running", match, List.of(first,
+                                                        new MinigameAgent.Member(second.uuid(), "Second", "red")), 3))) {
+                                agent.apply(invalid, Set.of(), command -> fail("Native dispatch"));
+                                assertEquals(2, reportVersion(agent));
+                                assertTrue(agent.allows(second.uuid()));
+                        }
+                        agent.apply(new MinigameAgent.Control("ending", match, List.of(first, second), 1), Set.of(),
+                                        command -> fail("Cancel dispatch"));
+                        assertEquals("ended", status(agent));
+                        assertEquals(2, reportVersion(agent));
+                }
+                try (var restarted = new MinigameAgent(null, config, path)) {
+                        restarted.ready();
+                        assertEquals("failed", status(restarted));
+                        assertFalse(restarted.allows(match));
+                        assertEquals(2, reportVersion(restarted));
+                }
+        }
+
+        @Test
+        void nativeFenceRequiresIncreasingVersionsAndOnlySafeAdditions() throws Exception {
+                Path path = data.resolve("native-fence.json");
+                var fence = new MinigameAgent.MatchFence(path, List.of(), "plugin");
+                var first = new MinigameAgent.Member(match, "Player", "");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "");
+                assertFalse(fence.updateNative(match, List.of(first), 0));
+                assertFalse(Files.exists(path));
+                assertTrue(fence.updateNative(match, List.of(first), 1));
+                assertFalse(fence.updateNative(match, List.of(first, second), 1));
+                assertTrue(fence.updateNative(match, List.of(first), 1));
+                assertTrue(fence.updateNative(match, List.of(first, second), 2));
+                assertFalse(fence.updateNative(match, List.of(second), 3));
+                assertFalse(fence.updateNative(match, List.of(first, new MinigameAgent.Member(UUID.randomUUID(), "Second", "")), 3));
+                assertThrows(IllegalArgumentException.class, () -> fence.updateNative(match, List.of(first, first), 3));
+                assertThrows(IllegalArgumentException.class, () -> fence.updateNative(match,
+                                List.of(first, new MinigameAgent.Member(second.uuid(), "bad;op", "")), 3));
+                assertThrows(IllegalArgumentException.class, () -> fence.updateNative(match,
+                                List.of(first, new MinigameAgent.Member(second.uuid(), "Second", "red")), 3));
+                assertEquals(2, fence.rosterVersion());
+                assertEquals(List.of(first, second), new MinigameAgent.MatchFence(path, List.of(), "plugin").roster());
+                assertFalse(fence.accept(match, List.of(first, second)));
+                var vestri = new MinigameAgent.MatchFence(data.resolve("vestri-fence.json"), List.of());
+                assertFalse(vestri.updateNative(match, List.of(first), 1));
+                assertTrue(vestri.accept(match, List.of(first)));
+                assertFalse(vestri.accept(match, List.of(first, second)));
+        }
+
+        @Test
+        void nativeEmptyLobbyStillNeedsReadyAndLogEndWorksBeforeAllJoined() throws Exception {
+                var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":[\"red\",\"blue\"]", "\"lobbyMode\":\"plugin\",\"teams\":[]"));
+                Path path = data.resolve("empty-native.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.ready();
+                        assertEquals("ready", status(agent));
+                        agent.apply(new MinigameAgent.Control("joining", match, List.of(), 1), Set.of(), command -> fail("Native dispatch"));
+                        assertEquals("running", status(agent));
+                        agent.observeLog("Game finished");
+                        agent.apply(null, Set.of(), command -> fail("Native dispatch"));
+                        assertEquals("ended", status(agent));
+                }
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        assertEquals("failed", status(agent));
+                }
+        }
+
+        @Test
+        void nativePersistenceFailureDoesNotAcknowledgeOrAdmitAdditions() throws Exception {
+                var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
+                var first = new MinigameAgent.Member(match, "Player", "red");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
+                Path path = data.resolve("native-failure.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("joining", match, List.of(first), 1), Set.of(), command -> fail("Native dispatch"));
+                        Files.delete(path);
+                        Files.createDirectory(path);
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(first, second), 2), Set.of(), command -> fail("Native dispatch"));
+                        assertEquals("failed", status(agent));
+                        assertEquals(1, reportVersion(agent));
+                        assertFalse(agent.allows(second.uuid()));
+                }
+        }
+
+        @Test
+        void lobbyModeAndWireVersionsAreStrictWithLegacyDefaultZero() throws Exception {
+                String text = config("http://vestri-proxy-123:25580");
+                assertEquals("vestri", MinigameAgent.configuration(text).lobbyMode());
+                for (String invalid : List.of("null", "1", "\"native\"", "\"\"")) {
+                        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(
+                                        text.replace("\"teams\":", "\"lobbyMode\":" + invalid + ",\"teams\":")));
+                }
+                assertEquals(0, MinigameAgent.control("{\"state\":\"ready\"}", List.of()).rosterVersion());
+                assertEquals(12, MinigameAgent.control("{\"state\":\"ready\",\"rosterVersion\":12}", List.of()).rosterVersion());
+                for (String invalid : List.of("null", "-1", "1.5", "1.0", "1e2", "\"1\"", "true", "2147483648")) {
+                        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.control(
+                                        "{\"state\":\"ready\",\"rosterVersion\":" + invalid + "}", List.of()));
+                }
+                try (var agent = new MinigameAgent(null, MinigameAgent.configuration(text), data.resolve("legacy-report.json"))) {
+                        assertEquals(0, reportVersion(agent));
+                }
+                Path legacy = data.resolve("legacy-claimed.json");
+                Files.writeString(legacy, "{\"matchId\":\"" + match + "\",\"startupClaimed\":true,\"roster\":["
+                                + "{\"uuid\":\"" + match + "\",\"name\":\"Player\",\"team\":\"red\"}]}");
+                try (var agent = new MinigameAgent(null, MinigameAgent.configuration(text), legacy)) {
+                        assertEquals("failed", status(agent));
+                        assertEquals(0, reportVersion(agent));
+                }
+        }
+
+        private int reportVersion(MinigameAgent agent) {
+                return com.google.gson.JsonParser.parseString(agent.statusReport(Set.of())).getAsJsonObject().get("rosterVersion").getAsInt();
+        }
+
+        @Test
     void boundsResponseBytesAcrossChunksAndCancelsOverflow() {
         var body = new MinigameAgent.BoundedBody(4);
         AtomicBoolean cancelled = new AtomicBoolean();
@@ -391,6 +562,155 @@ class MinigameAgentTest {
                 }));
                 assertEquals(List.of("first", "fail"), dispatched);
                 assertTrue(MinigameAgent.dispatch(List.of(), command -> false));
+        }
+
+        @Test
+        void diagnosticsRateLimitAcrossFailureKindsAndLogRecoveryOnce() {
+                Logger logger = Logger.getLogger("vestri-test-" + UUID.randomUUID());
+                logger.setUseParentHandlers(false);
+                List<LogRecord> logs = capture(logger);
+                AtomicLong now = new AtomicLong();
+                var diagnostics = new MinigameAgent.Diagnostics(logger, now::get);
+                diagnostics.failure("HTTP status=503");
+                diagnostics.failure("invalid response class=IllegalArgumentException");
+                assertEquals(1, logs.size());
+                now.set(TimeUnit.SECONDS.toNanos(29));
+                diagnostics.failure("transport class=TimeoutException");
+                assertEquals(1, logs.size());
+                now.set(TimeUnit.SECONDS.toNanos(30));
+                diagnostics.failure("transport class=TimeoutException");
+                assertEquals(2, logs.size());
+                diagnostics.recovered();
+                diagnostics.recovered();
+                assertEquals(3, logs.size());
+                assertEquals("Minigame control recovered.", logs.get(2).getMessage());
+                diagnostics.failure("HTTP status=401");
+                assertEquals(3, logs.size());
+                now.set(TimeUnit.SECONDS.toNanos(60));
+                diagnostics.failure("HTTP status=401");
+                assertEquals(4, logs.size());
+                String message = MinigameAgent.loadedMessage(MinigameAgent.configuration(config("http://vestri-proxy-123:25580")));
+                assertEquals("Minigame agent configured: slug=mcgame-123, lobbyMode=vestri, readiness=explicit", message);
+                assertFalse(message.contains("a".repeat(64)));
+                assertFalse(message.contains("http"));
+        }
+
+        @Test
+        void realPollingWarnsSafelyOnStatusAndMalformedResponseThenRecovers() throws Exception {
+                HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+                AtomicInteger responseCode = new AtomicInteger(503);
+                var body = new java.util.concurrent.atomic.AtomicReference<>("secret invalid body");
+                var authorization = new java.util.concurrent.atomic.AtomicReference<String>();
+                server.createContext("/control", exchange -> {
+                        authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+                        exchange.getRequestBody().readAllBytes();
+                        byte[] bytes = body.get().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(responseCode.get(), bytes.length);
+                        exchange.getResponseBody().write(bytes);
+                        exchange.close();
+                });
+                server.start();
+                Logger logger = Logger.getLogger("vestri-http-test-" + UUID.randomUUID());
+                logger.setUseParentHandlers(false);
+                List<LogRecord> logs = capture(logger);
+                AtomicLong now = new AtomicLong();
+                var config = new MinigameAgent.Configuration(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/control"),
+                                "a".repeat(64), List.of(), "explicit", List.of(), null);
+                try (var agent = new MinigameAgent(null, config, data.resolve("http.json"), new MinigameAgent.Diagnostics(logger, now::get))) {
+                        assertNull(agent.poll(agent.statusReport(Set.of())));
+                        assertEquals("Bearer " + config.token(), authorization.get());
+                        assertTrue(logs.get(0).getMessage().contains("status=503"));
+                        responseCode.set(200);
+                        assertNull(agent.poll(agent.statusReport(Set.of())));
+                        assertEquals(1, logs.size());
+                        now.set(TimeUnit.SECONDS.toNanos(30));
+                        assertNull(agent.poll(agent.statusReport(Set.of())));
+                        assertEquals(2, logs.size());
+                        assertTrue(logs.get(1).getMessage().contains("invalid response class="));
+                        body.set("{\"state\":\"ready\"}");
+                        assertEquals("ready", agent.poll(agent.statusReport(Set.of())).state());
+                        assertEquals("ready", agent.poll(agent.statusReport(Set.of())).state());
+                        assertEquals(3, logs.size());
+                        assertEquals("Minigame control recovered.", logs.get(2).getMessage());
+                        for (LogRecord record : logs) {
+                                assertFalse(record.getMessage().contains(config.token()));
+                                assertFalse(record.getMessage().contains("http://"));
+                                assertFalse(record.getMessage().contains("secret"));
+                                assertNull(record.getThrown());
+                        }
+                } finally {
+                        server.stop(0);
+                }
+        }
+
+        private List<LogRecord> capture(Logger logger) {
+                List<LogRecord> logs = new java.util.concurrent.CopyOnWriteArrayList<>();
+                logger.addHandler(new Handler() {
+                        public void publish(LogRecord record) { logs.add(record); }
+                        public void flush() { }
+                        public void close() { }
+                });
+                return logs;
+        }
+
+        @Test
+        void realPollDeadlinesCoverDelayedHeadersAndStalledBodyAndRecover() throws Exception {
+                for (boolean sendHeaders : List.of(false, true)) {
+                        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+                        CountDownLatch release = new CountDownLatch(1);
+                        CountDownLatch entered = new CountDownLatch(1);
+                        AtomicBoolean stall = new AtomicBoolean(true);
+                        server.createContext("/control", exchange -> {
+                                exchange.getRequestBody().readAllBytes();
+                                if (stall.get()) {
+                                        if (sendHeaders) {
+                                                exchange.sendResponseHeaders(200, 100);
+                                                exchange.getResponseBody().write('{');
+                                                exchange.getResponseBody().flush();
+                                        }
+                                        entered.countDown();
+                                        try {
+                                                release.await(10, TimeUnit.SECONDS);
+                                        } catch (InterruptedException failure) {
+                                                Thread.currentThread().interrupt();
+                                        } finally {
+                                                exchange.close();
+                                        }
+                                        return;
+                                }
+                                byte[] body = "{\"state\":\"ready\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                                exchange.sendResponseHeaders(200, body.length);
+                                exchange.getResponseBody().write(body);
+                                exchange.close();
+                        });
+                        server.start();
+                        Logger logger = Logger.getLogger("vestri-timeout-test-" + UUID.randomUUID());
+                        logger.setUseParentHandlers(false);
+                        List<LogRecord> logs = capture(logger);
+                        var config = new MinigameAgent.Configuration(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/control"),
+                                        "a".repeat(64), List.of(), "explicit", List.of(), null);
+                        try (var agent = new MinigameAgent(null, config, data.resolve("timeout-" + sendHeaders + ".json"),
+                                        new MinigameAgent.Diagnostics(logger, System::nanoTime))) {
+                                long started = System.nanoTime();
+                                var pending = java.util.concurrent.CompletableFuture.supplyAsync(() -> agent.poll(agent.statusReport(Set.of())));
+                                assertTrue(entered.await(2, TimeUnit.SECONDS));
+                                assertNull(pending.get(6, TimeUnit.SECONDS));
+                                assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(6));
+                                assertEquals(1, logs.size());
+                                assertTrue(logs.get(0).getMessage().contains("transport class="));
+                                assertTrue(logs.get(0).getMessage().contains("TimeoutException"));
+                                assertFalse(logs.get(0).getMessage().contains(config.token()));
+                                assertFalse(logs.get(0).getMessage().contains("http://"));
+                                stall.set(false);
+                                release.countDown();
+                                assertEquals("ready", agent.poll(agent.statusReport(Set.of())).state());
+                                assertEquals(2, logs.size());
+                                assertEquals("Minigame control recovered.", logs.get(1).getMessage());
+                        } finally {
+                                release.countDown();
+                                server.stop(0);
+                        }
+                }
         }
 
         @Test
