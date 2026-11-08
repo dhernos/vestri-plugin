@@ -52,6 +52,38 @@ file access follows the new location; older plugins retain legacy-path support.
 Paper/Spigot already keeps its bridge configuration in
 `plugins/VestriConsoleBridge/config.yml`.
 
+## Local Country Lookup
+
+Deploy the updated plugin JAR and restart the Velocity proxy to enable country
+lookup for player management; older installed plugins do not support it. The
+plugin automatically downloads the current UTC month's DB-IP Country Lite
+database from `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz`
+in the background and stores it at
+`plugins/vestri-dynamic/vestri-country.mmdb`. No account or API key is required,
+and player IP addresses are never sent to external HTTP services. The shaded
+JAR includes the MaxMind DB reader; lookups use only the local database in memory.
+
+Startup loads an existing valid database immediately. A single daemon checks
+daily and skips downloads when the local file's modification time is in the
+current UTC month. Monthly replacements are validated before atomic installation.
+Failed or unavailable downloads retain the previous database and retry on the
+next daily check, so existing data continues to work offline. Downloads have
+bounded connection/read timeouts and a 64 MiB decompressed limit.
+
+Missing data, invalid addresses, hostnames, private/local addresses, and unknown
+countries produce no country code. Unknown countries do not match a country
+ban, but cannot satisfy an enabled country whitelist. Country rules complement
+the existing UUID/IP rules; they are not a reliable identity or location proof.
+
+Country data is provided by [DB-IP](https://db-ip.com/db/download/ip-to-country-lite)
+and licensed under [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+Keep this attribution when distributing or using the downloaded data.
+
+Default GeoIP tests use a synthetic MMDB fixture and never access the network.
+An optional real download/restart check runs with
+`VESTRI_GEOIP_TEST=1 mvn -Dtest=CountryLookupTest test` and requires DB-IP HTTPS
+access and availability of the current month's download.
+
 ## Proxy Player Management (1.1.0)
 
 Deploy the 1.1.0 JAR to the Velocity proxy and restart the proxy. The panel's

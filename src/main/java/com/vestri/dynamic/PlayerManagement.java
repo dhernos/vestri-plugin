@@ -40,6 +40,8 @@ final class PlayerManagement {
     private static final int MAX_PLAYERS = 10000;
     private final Path directory;
     private final Logger logger;
+    private final CountryLookup countries;
+    private final java.util.function.Function<String, String> countryResolver;
     private final Map<InetSocketAddress, PendingLogin> pending = new LinkedHashMap<>();
     private final Map<String, JsonObject> players = new LinkedHashMap<>();
     private final ArrayDeque<JsonObject> attempts = new ArrayDeque<>();
@@ -50,6 +52,10 @@ final class PlayerManagement {
     private LocalDate lastPruned;
 
     PlayerManagement(Path directory, Logger logger) throws IOException {
+        this(directory, logger, null);
+    }
+
+    PlayerManagement(Path directory, Logger logger, java.util.function.Function<String, String> countryResolver) throws IOException {
         this.directory = directory;
         this.logger = logger;
         Path journal = directory.resolve("vestri-players.json");
@@ -73,6 +79,8 @@ final class PlayerManagement {
         }
         reloadPolicy();
         pruneArchives();
+        countries = countryResolver == null ? new CountryLookup(directory, logger) : null;
+        this.countryResolver = countryResolver == null ? countries::country : countryResolver;
     }
 
     private static JsonObject defaultPolicy() {
@@ -81,6 +89,9 @@ final class PlayerManagement {
         policy.add("whitelist", new JsonArray());
         policy.add("bans", new JsonArray());
         policy.add("ipBans", new JsonArray());
+        policy.addProperty("countryWhitelistEnabled", false);
+        policy.add("countryWhitelist", new JsonArray());
+        policy.add("countryBans", new JsonArray());
         return policy;
     }
 
@@ -117,6 +128,24 @@ final class PlayerManagement {
                 }
                 java.net.InetAddress.getByName(value.getAsString());
             }
+            if (!next.has("countryWhitelistEnabled")) {
+                next.addProperty("countryWhitelistEnabled", false);
+            }
+            if (!next.get("countryWhitelistEnabled").getAsJsonPrimitive().isBoolean()) {
+                throw new IOException("Invalid countryWhitelistEnabled");
+            }
+            var countryCodes = java.util.Set.of(java.util.Locale.getISOCountries());
+            for (String list : new String[]{"countryWhitelist", "countryBans"}) {
+                if (!next.has(list)) {
+                    next.add(list, new JsonArray());
+                }
+                for (var value : next.getAsJsonArray(list)) {
+                    if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()
+                            || !countryCodes.contains(value.getAsString())) {
+                        throw new IOException("Invalid country policy");
+                    }
+                }
+            }
             policy = next;
             policyHealthy = true;
             policyError = null;
@@ -138,6 +167,15 @@ final class PlayerManagement {
                 return "Your IP address is banned from this proxy.";
             }
         }
+        String country = countryResolver.apply(ip);
+        if (country != null && containsCountry("countryBans", country)) {
+            return "Connections from your country are banned from this proxy.";
+        }
+        if (policy.get("countryWhitelistEnabled").getAsBoolean()
+                && (country == null || !containsCountry("countryWhitelist", country))) {
+            return country == null ? "Your country could not be verified. Please retry later."
+                    : "Your country is not whitelisted on this proxy.";
+        }
         if (uuid == null) {
             return null;
         }
@@ -148,6 +186,15 @@ final class PlayerManagement {
             return "You are not whitelisted on this proxy.";
         }
         return null;
+    }
+
+    private boolean containsCountry(String list, String country) {
+        for (var value : policy.getAsJsonArray(list)) {
+            if (country.equals(value.getAsString())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean containsUUID(String list, UUID uuid) {
@@ -277,6 +324,8 @@ final class PlayerManagement {
             attempt.addProperty("uuid", login.uuid.toString());
         }
         attempt.addProperty("ip", login.ip());
+        String country = countryResolver.apply(login.ip());
+        attempt.addProperty("country", country);
         attempt.addProperty("time", login.time.toString());
         attempt.addProperty("completedAt", Instant.now().toString());
         attempt.addProperty("outcome", outcome);
@@ -294,10 +343,12 @@ final class PlayerManagement {
                 player.addProperty("name", login.name);
                 player.addProperty("lastAttempt", login.time.toString());
                 player.addProperty("lastIP", login.ip());
+                player.addProperty("lastCountry", country);
             }
             if ("success".equals(outcome) && (!player.has("lastLogin") || !Instant.parse(player.get("lastLogin").getAsString()).isAfter(login.time))) {
                 player.addProperty("lastLogin", login.time.toString());
                 player.addProperty("lastLoginIP", login.ip());
+                player.addProperty("lastLoginCountry", country);
             }
             players.put(id, player);
         }
@@ -334,6 +385,8 @@ final class PlayerManagement {
         JsonObject journal = new JsonObject();
         journal.addProperty("updatedAt", Instant.now().toString());
         journal.addProperty("policyHealthy", policyHealthy);
+        journal.addProperty("countryLookupAvailable", countries == null || countries.available());
+        journal.addProperty("countryPolicySupported", true);
         if (policyError != null) {
             journal.addProperty("policyError", policyError);
         }
@@ -355,7 +408,13 @@ final class PlayerManagement {
             }
         }
         pending.clear();
-        flush();
+        try {
+            flush();
+        } finally {
+            if (countries != null) {
+                countries.close();
+            }
+        }
     }
 
     private void pruneArchives() throws IOException {

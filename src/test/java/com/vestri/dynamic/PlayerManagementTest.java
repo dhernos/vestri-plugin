@@ -30,7 +30,7 @@ class PlayerManagementTest {
     Path directory;
 
     private PlayerManagement management() throws Exception {
-        return new PlayerManagement(directory, mock(Logger.class));
+        return new PlayerManagement(directory, mock(Logger.class), ip -> null);
     }
 
     private Player player() {
@@ -60,6 +60,72 @@ class PlayerManagementTest {
 
     private String entry() {
         return "[{\"uuid\":\"" + PLAYER + "\",\"name\":\"Notch\"}]";
+    }
+
+    private void countryPolicy(boolean enabled, String allowed, String banned) throws Exception {
+        policy(false, "[]", "[]", "[]");
+        JsonObject value = JsonParser.parseString(Files.readString(directory.resolve("vestri-player-policy.json"))).getAsJsonObject();
+        value.addProperty("countryWhitelistEnabled", enabled);
+        value.add("countryWhitelist", JsonParser.parseString(allowed));
+        value.add("countryBans", JsonParser.parseString(banned));
+        Files.writeString(directory.resolve("vestri-player-policy.json"), value.toString());
+    }
+
+    @Test
+    void countryBansOverrideWhitelistAndUnknownCountriesFailClosedOnlyWithWhitelist() throws Exception {
+        countryPolicy(false, "[]", "[\"DE\"]");
+        PlayerManagement known = new PlayerManagement(directory, mock(Logger.class), ip -> "DE");
+        PlayerManagement unknown = management();
+        assertTrue(known.denial(null, "203.0.113.8").contains("banned"));
+        assertNull(unknown.denial(null, "203.0.113.8"));
+        countryPolicy(true, "[\"DE\"]", "[\"DE\"]");
+        known.reloadPolicy();
+        assertTrue(known.denial(PLAYER, "203.0.113.8").contains("banned"));
+        countryPolicy(true, "[\"DE\"]", "[]");
+        known.reloadPolicy();
+        unknown.reloadPolicy();
+        assertNull(known.denial(PLAYER, "203.0.113.8"));
+        assertNotNull(unknown.denial(null, "203.0.113.8"));
+        countryPolicy(true, "[\"US\"]", "[]");
+        known.reloadPolicy();
+        assertNotNull(known.denial(null, "203.0.113.8"));
+    }
+
+    @Test
+    void countriesAreRecordedAlongsideTheirIPsAndUpdatedRulesDisconnectOnlinePlayers() throws Exception {
+        PlayerManagement management = new PlayerManagement(directory, mock(Logger.class), ip -> "DE");
+        Player player = player();
+        management.beforeLogin(new PreLoginEvent(connection(true), "Notch"));
+        management.login(new LoginEvent(player));
+        management.connected(player);
+        management.flush();
+        JsonObject known = journal().getAsJsonArray("players").get(0).getAsJsonObject();
+        assertEquals("DE", known.get("lastCountry").getAsString());
+        assertTrue(journal().get("countryPolicySupported").getAsBoolean());
+        assertTrue(journal().get("countryLookupAvailable").getAsBoolean());
+        assertEquals("DE", known.get("lastLoginCountry").getAsString());
+        assertEquals("DE", journal().getAsJsonArray("attempts").get(0).getAsJsonObject().get("country").getAsString());
+        countryPolicy(false, "[]", "[\"DE\"]");
+        ProxyServer proxy = mock(ProxyServer.class);
+        when(proxy.getAllPlayers()).thenReturn(List.of(player));
+        management.sweep(proxy);
+        verify(player).disconnect(any(Component.class));
+        PreLoginEvent denied = new PreLoginEvent(connection(true), "Notch");
+        management.beforeLogin(denied);
+        assertFalse(denied.getResult().isAllowed());
+    }
+
+    @Test
+    void malformedCountryRulesFailClosedAndLegacyPoliciesRemainCompatible() throws Exception {
+        PlayerManagement management = management();
+        for (String countries : List.of("null", "[\"ZZ\"]", "[\"de\"]", "[true]")) {
+            countryPolicy(false, "[]", countries);
+            management.reloadPolicy();
+            assertNotNull(management.denial(null, "203.0.113.8"));
+        }
+        policy(false, "[]", "[]", "[]");
+        management.reloadPolicy();
+        assertNull(management.denial(PLAYER, "203.0.113.8"));
     }
 
     @Test
