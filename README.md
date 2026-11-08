@@ -804,7 +804,7 @@ minigame:
         forEach: player
       - command: "say Match {matchId} ready"
     end:
-      logPattern: '^MATCH_END$'
+      logPattern: "^MATCH_END$"
       whenEmpty: true
       emptyGrace: 10s
       returnPlayersTo: lobby
