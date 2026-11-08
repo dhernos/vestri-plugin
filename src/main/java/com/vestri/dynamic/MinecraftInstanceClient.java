@@ -35,6 +35,16 @@ final class MinecraftInstanceClient {
         this(backend, keys, Thread::sleep);
     }
 
+    MinecraftInstanceClient(JsonObject configuration) throws IOException {
+        this(fromConfiguration(configuration));
+    }
+
+    private MinecraftInstanceClient(MinecraftInstanceClient captured) {
+        endpoint = captured.endpoint;
+        templateKeys = Map.copyOf(captured.templateKeys);
+        retryDelay = captured.retryDelay;
+    }
+
     @FunctionalInterface
     interface RetryDelay {
         void pause(long milliseconds) throws InterruptedException;
@@ -98,6 +108,25 @@ final class MinecraftInstanceClient {
     }
 
     static MinecraftInstanceClient load(Path file) throws IOException {
+        return fromConfiguration(readConfiguration(file));
+    }
+
+    static JsonObject snapshot(Path file, String template) throws IOException {
+        JsonObject configuration = readConfiguration(file);
+        MinecraftInstanceClient validated = fromConfiguration(configuration);
+        String key = validated.templateKeys.get(normalizeName(template));
+        if (key == null) {
+            throw new IOException("Unknown configured template; original lifecycle credentials unavailable");
+        }
+        JsonObject snapshot = new JsonObject();
+        snapshot.addProperty("backendUrl", configuration.get("backendUrl").getAsString().trim());
+        JsonObject templates = new JsonObject();
+        templates.addProperty(template, key);
+        snapshot.add("templates", templates);
+        return snapshot;
+    }
+
+    private static JsonObject readConfiguration(Path file) throws IOException {
         if (createDefaultConfiguration(file)) {
             throw new IOException("Created " + file.getFileName() + "; set backendUrl to your frontend origin and add template API keys before spawning");
         }
@@ -109,6 +138,13 @@ final class MinecraftInstanceClient {
             config = JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8)).getAsJsonObject();
         } catch (RuntimeException failure) {
             throw new IOException("Invalid plugin configuration: expected a JSON object (check commas, quotes, and braces)");
+        }
+        return config;
+    }
+
+    private static MinecraftInstanceClient fromConfiguration(JsonObject config) throws IOException {
+        if (config == null) {
+            throw new IOException("Invalid plugin configuration: expected a JSON object");
         }
         if (!config.has("backendUrl") || !config.get("backendUrl").isJsonPrimitive()
                 || !config.getAsJsonPrimitive("backendUrl").isString()) {

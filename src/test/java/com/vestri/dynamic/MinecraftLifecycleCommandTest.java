@@ -5,8 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.velocitypowered.api.command.SimpleCommand.Invocation;
@@ -25,9 +30,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class MinecraftLifecycleCommandTest {
     @TempDir
@@ -186,6 +195,144 @@ class MinecraftLifecycleCommandTest {
             server.stop(0);
         }
     }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"plugin", "vestri"})
+    void handledMinigameJoinUsesExactTargetAndForwardsHookOutputWithoutOrdinaryTransfer(String lobbyMode) throws Exception {
+        Minigames minigames = mock(Minigames.class);
+        String message = lobbyMode.equals("plugin") ? "Reserved native minigame slot." : "Joined managed minigame queue.";
+        doAnswer(invocation -> {
+            Consumer<String> output = invocation.getArgument(2);
+            output.accept(message);
+            return true;
+        }).when(minigames).joinInstance(any(), any(), any());
+
+        SpawnResult result = executeSpawn(minigames, true,
+                "{\"minigames\":{\"Bed Wars\":{\"lobbyMode\":\"" + lobbyMode + "\"}}}");
+
+        assertEquals(List.of("POST"), result.calls());
+        verify(minigames).joinInstance(eq(result.player()), eq(result.instance()), any());
+        verify(result.transfer(), never()).start(any(), any(), any());
+        verify(result.console()).sendMessage(Component.text(message, NamedTextColor.AQUA));
+    }
+
+    @Test
+    void unhandledJoinFallsBackToOrdinaryTransferWithExactTarget() throws Exception {
+        Minigames minigames = mock(Minigames.class);
+        when(minigames.joinInstance(any(), any(), any())).thenReturn(false);
+
+        SpawnResult result = executeSpawn(minigames, true, null);
+
+        assertEquals(List.of("POST"), result.calls());
+        verify(minigames).joinInstance(eq(result.player()), eq(result.instance()), any());
+        verify(result.transfer()).start(eq(result.player()), eq(result.instance()), any());
+    }
+
+    @Test
+    void unavailableMinigamesRejectsMatchingTemplateBeforeSpawning() throws Exception {
+        SpawnResult result = executeSpawn(null, true, "{\"minigames\":{\"bed wars\":{}}}");
+
+        assertEquals(List.of(), result.calls());
+        verify(result.transfer(), never()).start(any(), any(), any());
+        verify(result.console()).sendMessage(Component.text(
+                "Vestri command failed: Minigame management is unavailable; no instance was spawned.", NamedTextColor.AQUA));
+    }
+
+    @Test
+    void unavailableMinigamesDoesNotBlockOrdinaryTemplateInManifest() throws Exception {
+        SpawnResult result = executeSpawn(null, true, "{\"minigames\":{\"Other Game\":{}}}");
+
+        assertEquals(List.of("POST"), result.calls());
+        verify(result.transfer()).start(eq(result.player()), eq(result.instance()), any());
+    }
+
+    @Test
+    void legacyFourArgumentConstructorWithoutManifestStillTransfersOrdinarySpawn() throws Exception {
+        SpawnResult result = executeSpawn(null, true, null);
+
+        assertEquals(List.of("POST"), result.calls());
+        verify(result.transfer()).start(eq(result.player()), eq(result.instance()), any());
+    }
+
+    @Test
+    void plainConsoleSpawnDoesNotInvokeMinigameJoinOrPlayerTransfer() throws Exception {
+        Minigames minigames = mock(Minigames.class);
+        SpawnResult result = executeSpawn(minigames, false, "{\"minigames\":{\"Bed Wars\":{}}}");
+
+        assertEquals(List.of("POST"), result.calls());
+        verifyNoInteractions(minigames, result.transfer());
+        verify(result.console()).sendMessage(Component.text("Server starting: BedWars-7", NamedTextColor.AQUA));
+    }
+
+    @Test
+    void plainConsoleMinigameSpawnStillWorksWithoutCoordinator() throws Exception {
+        SpawnResult result = executeSpawn(null, false, "{\"minigames\":{\"Bed Wars\":{}}}");
+
+        assertEquals(List.of("POST"), result.calls());
+        verifyNoInteractions(result.transfer());
+        verify(result.console()).sendMessage(Component.text("Server starting: BedWars-7", NamedTextColor.AQUA));
+    }
+
+    private SpawnResult executeSpawn(Minigames minigames, boolean sendPlayer, String manifest) throws Exception {
+        UUID request = UUID.randomUUID();
+        UUID playerId = UUID.randomUUID();
+        var instance = new MinecraftInstanceClient.SpawnedInstance(UUID.randomUUID().toString(),
+                "mcgame-" + "b".repeat(32), "BedWars-7");
+        Player player = (Player) java.lang.reflect.Proxy.newProxyInstance(Player.class.getClassLoader(),
+                new Class<?>[]{Player.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "getUniqueId" -> playerId;
+                    case "getUsername" -> "Luis";
+                    case "isActive" -> true;
+                    case "equals" -> proxy == arguments[0];
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "toString" -> "Luis";
+                    default -> null;
+                });
+        SpawnPlayerTransfer transfer = mock(SpawnPlayerTransfer.class);
+        when(transfer.findPlayer("Luis")).thenReturn(player);
+        ConsoleCommandSource console = mock(ConsoleCommandSource.class);
+        Invocation invocation = mock(Invocation.class);
+        when(invocation.source()).thenReturn(console);
+        when(invocation.arguments()).thenReturn(sendPlayer
+                ? new String[]{"spawn", "Bed Wars", "--send-player", "Luis", "--request-id", request.toString()}
+                : new String[]{"spawn", "Bed Wars", "--request-id", request.toString()});
+        List<String> calls = new ArrayList<>();
+        String key = "vmc_" + "a".repeat(64);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/api/minecraft/v1/instances", exchange -> {
+            calls.add(exchange.getRequestMethod());
+            assertEquals("Bearer " + key, exchange.getRequestHeaders().getFirst("Authorization"));
+            assertTrue(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).contains(request.toString()));
+            byte[] response = ("{\"serverId\":\"" + instance.serverId() + "\",\"slug\":\"" + instance.slug()
+                    + "\",\"name\":\"" + instance.name() + "\"}").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+        try {
+            Path config = directory.resolve("spawn.json");
+            Files.writeString(config, "{\"backendUrl\":\"http://127.0.0.1:" + server.getAddress().getPort()
+                    + "\",\"templates\":{\"Bed Wars\":\"" + key + "\"}}");
+            if (manifest != null) {
+                Files.writeString(directory.resolve("vestri-dynamic-servers.json"), manifest);
+            }
+            List<Runnable> scheduled = new ArrayList<>();
+            MinecraftLifecycleCommand command = minigames == null
+                    ? new MinecraftLifecycleCommand(scheduled::add, config, transfer, null)
+                    : new MinecraftLifecycleCommand(scheduled::add, config, transfer, null, minigames);
+            command.execute(invocation);
+            assertEquals(List.of(), calls);
+            assertEquals(1, scheduled.size());
+            scheduled.get(0).run();
+            return new SpawnResult(calls, player, instance, transfer, console);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    private record SpawnResult(List<String> calls, Player player, MinecraftInstanceClient.SpawnedInstance instance,
+            SpawnPlayerTransfer transfer, ConsoleCommandSource console) {}
 
     @Test
     void executesScheduledCommandWithConfigurationFromDisk() throws Exception {

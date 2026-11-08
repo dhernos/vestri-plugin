@@ -111,7 +111,7 @@ public final class VestriDynamicServers {
         }
         MinecraftLifecycleCommand lifecycle = new MinecraftLifecycleCommand(
             task -> proxy.getScheduler().buildTask(this, task).schedule(), dataDirectory.resolve("vestri-dynamic-config.json"),
-            playerTransfer, playerServers);
+            playerTransfer, playerServers, minigames);
         proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("vestridynamic").plugin(this).build(), new SimpleCommand() {
             @Override
             public boolean hasPermission(Invocation invocation) {

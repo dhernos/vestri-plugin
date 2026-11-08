@@ -21,6 +21,7 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
     private final Path configuration;
     private final SpawnPlayerTransfer transfer;
     private final PlayerServers playerServers;
+    private final Minigames minigames;
 
     MinecraftLifecycleCommand(Consumer<Runnable> schedule, Path configuration) {
         this(schedule, configuration, null);
@@ -31,10 +32,16 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
     }
 
     MinecraftLifecycleCommand(Consumer<Runnable> schedule, Path configuration, SpawnPlayerTransfer transfer, PlayerServers playerServers) {
+        this(schedule, configuration, transfer, playerServers, null);
+    }
+
+    MinecraftLifecycleCommand(Consumer<Runnable> schedule, Path configuration, SpawnPlayerTransfer transfer,
+            PlayerServers playerServers, Minigames minigames) {
         this.schedule = schedule;
         this.configuration = configuration;
         this.transfer = transfer;
         this.playerServers = playerServers;
+        this.minigames = minigames;
     }
 
     @Override
@@ -94,6 +101,9 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                         yield "Instances for " + command.template() + ": " + (ids.isEmpty() ? "none" : String.join(", ", ids));
                     }
                     case "spawn" -> {
+                        if (selected != null && minigames == null && isMinigameTemplate(command.template())) {
+                            throw new IOException("Minigame management is unavailable; no instance was spawned.");
+                        }
                         if (command.serverType() != null) {
                             if (playerServers == null) {
                                 throw new IOException("Player server management is unavailable; check the owned server registry.");
@@ -107,7 +117,10 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                         }
                         var instance = client.spawnWithTarget(command.template(), command.requestId());
                         invocation.source().sendMessage(Component.text("Server starting: " + (instance.name() == null ? command.template() : instance.name()), NamedTextColor.AQUA));
-                        transfer.start(selected, instance, message -> invocation.source().sendMessage(Component.text(message, NamedTextColor.AQUA)));
+                        Consumer<String> output = message -> invocation.source().sendMessage(Component.text(message, NamedTextColor.AQUA));
+                        if (minigames == null || !minigames.joinInstance(selected, instance, output)) {
+                            transfer.start(selected, instance, output);
+                        }
                         yield null;
                     }
                     case "delete" -> "Instance deleted: " + client.delete(command.template(), command.instanceId());
@@ -128,6 +141,19 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                 invocation.source().sendMessage(Component.text("Vestri command failed: invalid configuration or API response.", NamedTextColor.AQUA));
             }
         });
+    }
+
+    private boolean isMinigameTemplate(String template) throws IOException {
+        Path manifest = configuration.resolveSibling("vestri-dynamic-servers.json");
+        if (!Files.exists(manifest)) {
+            return false;
+        }
+        if (Files.size(manifest) > 1024 * 1024) {
+            throw new IOException("Dynamic server manifest exceeds 1 MiB");
+        }
+        var games = JsonParser.parseString(Files.readString(manifest, StandardCharsets.UTF_8))
+                .getAsJsonObject().getAsJsonObject("minigames");
+        return games != null && games.keySet().stream().anyMatch(name -> name.trim().equalsIgnoreCase(template.trim()));
     }
 
     static LifecycleRequest parse(String[] arguments) {

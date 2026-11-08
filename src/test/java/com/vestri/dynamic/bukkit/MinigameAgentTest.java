@@ -32,6 +32,17 @@ class MinigameAgentTest {
         @TempDir Path data;
     private final UUID match = UUID.fromString("12345678-1234-1234-1234-123456789abc");
 
+        @Test
+        void unavailableControlIsPermanentOnly() {
+                String response = "{\"state\":\"unavailable\",\"matchId\":\"" + match
+                                + "\",\"rosterVersion\":2,\"roster\":[]}";
+                assertThrows(IllegalArgumentException.class, () -> MinigameAgent.control(response, List.of()));
+                var control = MinigameAgent.control(response, List.of(), "permanent");
+                assertEquals("unavailable", control.state());
+                assertEquals(2, control.rosterVersion());
+                assertEquals(match, control.matchId());
+        }
+
     @Test
     void expandsActionsInConfiguredOrder() {
         UUID first = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
@@ -509,6 +520,260 @@ class MinigameAgentTest {
                         assertEquals("failed", status(agent));
                         assertEquals(0, reportVersion(agent));
                 }
+        }
+
+        @Test
+        void permanentNativeRestartRestoresRosterButWaitsForReadinessWithoutReplay() throws Exception {
+                String text = config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"instanceMode\":\"permanent\",\"lobbyMode\":\"plugin\",\"teams\":")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
+                                .replace("\"logPattern\":\"finished\"", "\"deleteServer\":false,\"whenEmpty\":false");
+                var config = MinigameAgent.configuration(text);
+                Path path = data.resolve("permanent.json");
+                var roster = List.of(new MinigameAgent.Member(match, "Player", "red"));
+                var control = new MinigameAgent.Control("starting", match, roster, 1);
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.ready();
+                        agent.apply(control, Set.of(match), command -> fail("Permanent native dispatch"));
+                        assertEquals("running", status(agent));
+                }
+                try (var restored = new MinigameAgent(null, config, path)) {
+                        assertEquals("joining", status(restored));
+                        assertEquals(1, reportVersion(restored));
+                        assertFalse(restored.allows(match));
+                        restored.apply(control, Set.of(match), command -> fail("Restart replay"));
+                        assertEquals("joining", status(restored));
+                        restored.ready();
+                        assertEquals("running", status(restored));
+                        assertTrue(restored.allows(match));
+                        assertEquals(match.toString(), com.google.gson.JsonParser.parseString(restored.statusReport(Set.of()))
+                                        .getAsJsonObject().get("matchId").getAsString());
+                }
+        }
+
+        @Test
+        void permanentUnavailableRosterWaitsForReadyThenReportsRunningAndExactVersion() throws Exception {
+                String text = config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"instanceMode\":\"permanent\",\"lobbyMode\":\"plugin\",\"teams\":")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
+                                .replace("\"logPattern\":\"finished\"", "\"deleteServer\":false,\"whenEmpty\":false");
+                var config = MinigameAgent.configuration(text);
+                String response = "{\"state\":\"unavailable\",\"matchId\":\"" + match
+                                + "\",\"rosterVersion\":2,\"roster\":[{\"uuid\":\"" + match
+                                + "\",\"name\":\"Player\",\"team\":\"red\"}]}";
+                var control = MinigameAgent.control(response, config.teams(), config.instanceMode());
+                try (var agent = new MinigameAgent(null, config, data.resolve("unavailable.json"))) {
+                        agent.apply(control, Set.of(), command -> fail("Permanent native dispatch"));
+                        assertEquals("joining", status(agent));
+                        assertFalse(agent.allows(match));
+                        assertEquals(2, reportVersion(agent));
+                        agent.ready();
+                        assertEquals("running", status(agent));
+                        assertTrue(agent.allows(match));
+                        assertEquals(2, reportVersion(agent));
+                        agent.apply(control, Set.of(), command -> fail("Permanent native dispatch"));
+                        assertEquals("running", status(agent));
+                }
+        }
+
+        @Test
+        void permanentFullRosterRemovesReplacesAndRestoresEmptyDenyAll() throws Exception {
+                var config = MinigameAgent.configuration(permanentConfig());
+                var first = new MinigameAgent.Member(match, "Player", "red");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
+                var replacement = new MinigameAgent.Member(UUID.randomUUID(), "Replacement", "blue");
+                Path path = data.resolve("permanent-roster.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        assertEquals("joining", status(agent));
+                        agent.ready();
+                        assertEquals("ready", status(agent));
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(first, second), 1), Set.of(),
+                                        command -> fail("Native dispatch"));
+                        assertTrue(agent.allows(second.uuid()));
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(first, replacement), 2), Set.of(first.uuid()),
+                                        command -> fail("Native reset"));
+                        assertFalse(agent.allows(second.uuid()));
+                        assertTrue(agent.allows(first.uuid()));
+                        assertTrue(agent.allows(replacement.uuid()));
+                        assertEquals("running", status(agent));
+                        var empty = MinigameAgent.control("{\"state\":\"running\",\"matchId\":\"" + match
+                                        + "\",\"rosterVersion\":3,\"roster\":[]}", config.teams());
+                        agent.apply(empty, Set.of(), command -> fail("Empty native reset"));
+                        assertEquals("running", status(agent));
+                        assertEquals(3, reportVersion(agent));
+                        assertFalse(agent.allows(first.uuid()));
+                        assertFalse(agent.allows(replacement.uuid()));
+                        assertFalse(agent.allows(UUID.randomUUID()));
+                }
+                try (var restored = new MinigameAgent(null, config, path)) {
+                        assertEquals("joining", status(restored));
+                        assertEquals(3, reportVersion(restored));
+                        restored.ready();
+                        assertEquals("running", status(restored));
+                        assertFalse(restored.allows(match));
+                        var report = com.google.gson.JsonParser.parseString(restored.statusReport(Set.of())).getAsJsonObject();
+                        assertEquals(match.toString(), report.get("matchId").getAsString());
+                        assertTrue(report.getAsJsonArray("players").isEmpty());
+                }
+        }
+
+        @Test
+        void permanentRejectsStaleVersionsAndRetainedIdentityChangesWithoutWriting() throws Exception {
+                var config = MinigameAgent.configuration(permanentConfig());
+                Path path = data.resolve("permanent-identities.json");
+                var first = new MinigameAgent.Member(match, "Player", "red");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(first, second), 5), Set.of(),
+                                        command -> fail("Native dispatch"));
+                        String saved = Files.readString(path);
+                        for (var invalid : List.of(
+                                        new MinigameAgent.Control("running", match, List.of(first), 5),
+                                        new MinigameAgent.Control("running", match, List.of(first, second), 4),
+                                        new MinigameAgent.Control("running", match, List.of(), 0),
+                                        new MinigameAgent.Control("running", UUID.randomUUID(), List.of(first), 6),
+                                        new MinigameAgent.Control("running", match, List.of(new MinigameAgent.Member(match, "Renamed", "red")), 6),
+                                        new MinigameAgent.Control("running", match, List.of(new MinigameAgent.Member(match, "Player", "blue")), 6))) {
+                                agent.apply(invalid, Set.of(), command -> fail("Native dispatch"));
+                                assertEquals(5, reportVersion(agent));
+                                assertEquals("running", status(agent));
+                                assertTrue(agent.allows(first.uuid()));
+                                assertTrue(agent.allows(second.uuid()));
+                                assertEquals(saved, Files.readString(path));
+                        }
+                        agent.apply(new MinigameAgent.Control("starting", match, List.of(second, first), 5), Set.of(),
+                                        command -> fail("No repeated round dispatch"));
+                        assertEquals(saved, Files.readString(path));
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(first), 6), Set.of(),
+                                        command -> fail("Native dispatch"));
+                        assertEquals(6, reportVersion(agent));
+                        assertFalse(agent.allows(second.uuid()));
+                }
+                try (var restored = new MinigameAgent(null, config, path)) {
+                        restored.ready();
+                        assertTrue(restored.allows(first.uuid()));
+                        assertFalse(restored.allows(second.uuid()));
+                        assertEquals(6, reportVersion(restored));
+                }
+        }
+
+        @Test
+        void permanentLogManualAndProxyEndRemainActiveAndInformational() throws Exception {
+                var config = MinigameAgent.configuration(permanentConfig());
+                Logger logger = Logger.getLogger("vestri-permanent-end-" + UUID.randomUUID());
+                logger.setUseParentHandlers(false);
+                var logs = capture(logger);
+                Path path = data.resolve("permanent-end.json");
+                try (var agent = new MinigameAgent(null, config, path, new MinigameAgent.Diagnostics(logger, System::nanoTime))) {
+                        agent.end();
+                        assertEquals("joining", status(agent));
+                        agent.ready();
+                        agent.end();
+                        assertEquals("ready", status(agent));
+                        var roster = List.of(new MinigameAgent.Member(match, "Player", "red"));
+                        agent.apply(new MinigameAgent.Control("starting", match, roster, 1), Set.of(),
+                                        command -> fail("Permanent commands"));
+                        String saved = Files.readString(path);
+                        agent.observeLog("Game finished");
+                        agent.apply(null, Set.of(), command -> fail("Log dispatch"));
+                        assertEquals("running", status(agent));
+                        agent.end();
+                        agent.apply(new MinigameAgent.Control("ending", match, roster, 1), Set.of(),
+                                        command -> fail("End dispatch"));
+                        agent.apply(new MinigameAgent.Control("ending", match, null, 1), Set.of(),
+                                        command -> fail("End dispatch"));
+                        assertEquals("running", status(agent));
+                        assertTrue(agent.allows(match));
+                        assertEquals(saved, Files.readString(path));
+                        assertEquals(4, logs.size());
+                        for (var log : logs) {
+                                assertEquals(java.util.logging.Level.INFO, log.getLevel());
+                                assertTrue(log.getMessage().contains("end ignored"));
+                                assertFalse(log.getMessage().contains(config.token()));
+                        }
+                }
+        }
+
+        @Test
+        void permanentLifecycleIsStrictAndOptionalTeamsRemainSupported() {
+                String text = permanentConfig();
+                assertEquals("temporary", MinigameAgent.configuration(config("http://vestri-proxy-123:25580")).instanceMode());
+                assertEquals("permanent", MinigameAgent.configuration(text).instanceMode());
+                for (String invalid : List.of("null", "true", "1", "\"\"", "\"persistent\"")) {
+                        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(
+                                        text.replace("\"instanceMode\":\"permanent\"", "\"instanceMode\":" + invalid)));
+                }
+                for (String invalid : List.of(
+                                text.replace("\"lobbyMode\":\"plugin\",", ""),
+                                text.replace("\"lobbyMode\":\"plugin\"", "\"lobbyMode\":\"vestri\""),
+                                text.replace("\"deleteServer\":false", "\"deleteServer\":true"),
+                                text.replace("\"whenEmpty\":false", "\"whenEmpty\":true"),
+                                text.replace("\"deleteServer\":false,", ""),
+                                text.replace(",\"whenEmpty\":false", ""),
+                                text.replace("\"whenEmpty\":false", "\"whenEmpty\":\"false\""),
+                                text.replace("\"whenEmpty\":false", "\"whenEmpty\":null"),
+                                text.replace("\"whenEmpty\":false", "\"whenEmpty\":false,\"logPattern\":\"\""),
+                                text.replace("\"whenEmpty\":false", "\"whenEmpty\":false,\"logPattern\":\"finished\""),
+                                text.replace("\"onAllJoined\":[]", "\"onAllJoined\":[{\"command\":\"restart\"}]"))) {
+                        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(invalid));
+                }
+                for (String teams : List.of("\"teams\":[],", "\"teams\":null,", "")) {
+                        var parsed = MinigameAgent.configuration(text.replace("\"teams\":[\"red\",\"blue\"],", teams));
+                        assertTrue(parsed.teams().isEmpty());
+                        assertNull(parsed.endPattern());
+                }
+        }
+
+        @Test
+        void permanentFenceBindsCredentialsAndCannotBeReinterpretedAsTemporary() throws Exception {
+                var config = MinigameAgent.configuration(permanentConfig());
+                Path path = data.resolve("permanent-credentials.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(), 1), Set.of(),
+                                        command -> fail("Native dispatch"));
+                }
+                assertFalse(Files.readString(path).contains(config.token()));
+                for (String changed : List.of(permanentConfig().replace("a".repeat(64), "b".repeat(64)),
+                                permanentConfig().replace("mcgame-123", "mcgame-456"),
+                                permanentConfig().replace("vestri-proxy-123", "vestri-proxy-456"),
+                                permanentConfig().replace("\"instanceMode\":\"permanent\"", "\"instanceMode\":\"temporary\""))) {
+                        assertThrows(IllegalArgumentException.class, () -> new MinigameAgent(null,
+                                        MinigameAgent.configuration(changed), path));
+                }
+                var saved = com.google.gson.JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+                saved.remove("credentialBinding");
+                Files.writeString(path, saved.toString());
+                assertThrows(IllegalArgumentException.class, () -> new MinigameAgent(null, config, path));
+        }
+
+        @Test
+        void permanentPersistenceFailureClosesAdmissionWithoutAcknowledgingNewRoster() throws Exception {
+                var config = MinigameAgent.configuration(permanentConfig());
+                Path path = data.resolve("permanent-write-failure.json");
+                try (var agent = new MinigameAgent(null, config, path)) {
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("running", match,
+                                        List.of(new MinigameAgent.Member(match, "Player", "red")), 1), Set.of(),
+                                        command -> fail("Native dispatch"));
+                        Files.delete(path);
+                        Files.createDirectory(path);
+                        agent.apply(new MinigameAgent.Control("running", match, List.of(), 2), Set.of(),
+                                        command -> fail("Native dispatch"));
+                        assertEquals("failed", status(agent));
+                        assertEquals(1, reportVersion(agent));
+                        assertFalse(agent.allows(match));
+                        agent.end();
+                        agent.ready();
+                        assertEquals("failed", status(agent));
+                }
+        }
+
+        private String permanentConfig() {
+                return config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"instanceMode\":\"permanent\",\"lobbyMode\":\"plugin\",\"teams\":")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
+                                .replace("\"logPattern\":\"finished\"", "\"deleteServer\":false,\"whenEmpty\":false");
         }
 
         private int reportVersion(MinigameAgent agent) {

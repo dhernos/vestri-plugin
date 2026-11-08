@@ -16,6 +16,24 @@ class MinigameSpecTest {
     }
 
     @Test
+    void permanentRequiresPluginLobbyAndNonDeletingLifecycle() {
+        JsonObject json = spec();
+        assertFalse(MinigameSpec.parse(json).permanent());
+        json.addProperty("instanceMode", "permanent");
+        assertThrows(IllegalArgumentException.class, () -> MinigameSpec.parse(json));
+        json.addProperty("lobbyMode", "plugin");
+        assertThrows(IllegalArgumentException.class, () -> MinigameSpec.parse(json));
+        JsonObject end = json.getAsJsonObject("lifecycle").getAsJsonObject("end");
+        end.addProperty("deleteServer", false);
+        assertTrue(MinigameSpec.parse(json).permanent());
+        end.addProperty("whenEmpty", true);
+        assertThrows(IllegalArgumentException.class, () -> MinigameSpec.parse(json));
+        end.addProperty("whenEmpty", false);
+        json.addProperty("instanceMode", "unknown");
+        assertThrows(IllegalArgumentException.class, () -> MinigameSpec.parse(json));
+    }
+
+    @Test
     void absentNullAndEmptyTeamsAreTeamfreeAndDefaultToVestri() {
         JsonObject json = spec();
         for (String teams : new String[] {null, "null", "[]"}) {

@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -124,6 +125,26 @@ class MinecraftInstanceClientTest {
     @AfterEach
     void stopServer() {
         server.stop(0);
+    }
+
+    @Test
+    void snapshotPinsOnlyOriginalTemplateAndOriginAcrossRotationAndMutation() throws Exception {
+        Path config = directory.resolve("snapshot.json");
+        Files.writeString(config, "{\"backendUrl\":\"http://127.0.0.1:" + server.getAddress().getPort()
+                + "\",\"templates\":{\"Bed Wars\":\"" + key + "\",\"Other\":\"vmc_" + "c".repeat(64)
+                + "\"},\"consoleBridge\":{\"secret\":\"not-captured\"}}");
+        var snapshot = MinecraftInstanceClient.snapshot(config, "Bed Wars");
+        assertEquals(Set.of("backendUrl", "templates"), snapshot.keySet());
+        assertEquals(Set.of("Bed Wars"), snapshot.getAsJsonObject("templates").keySet());
+        MinecraftInstanceClient captured = new MinecraftInstanceClient(snapshot);
+        Files.writeString(config, "{\"backendUrl\":\"https://changed.example.com\",\"templates\":{\"Bed Wars\":\"vmc_"
+                + "d".repeat(64) + "\"}}");
+        assertEquals(instance.toString(), new MinecraftInstanceClient(snapshot).spawn("Bed Wars", UUID.randomUUID()));
+        snapshot.addProperty("backendUrl", "https://changed.example.com");
+        snapshot.getAsJsonObject("templates").addProperty("Bed Wars", "vmc_" + "d".repeat(64));
+        Files.writeString(config, "{");
+        assertEquals(instance.toString(), captured.spawn("Bed Wars", UUID.randomUUID()));
+        assertEquals(2, calls.size());
     }
 
     @Test

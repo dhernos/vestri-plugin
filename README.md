@@ -166,8 +166,9 @@ not covered by player-event retention and require their own retention policy.
 The backend writes the manifest and the worker triggers synchronization. The
 plugin does not balance players for ordinary templates; minigame matchmaking
 and roster assignment are described separately below. Plain spawn commands do not
-wait for readiness or move players; the optional `--send-player` flag waits for
-a Minecraft status ping and connects the selected player to that exact instance.
+wait for readiness or move players; for ordinary templates, `--send-player` waits
+for a Minecraft status ping and connects the player to that exact instance.
+Minigame instances also require roster admission; a ping cannot bypass that gate.
 Player-owned instances additionally have automatic empty-server maintenance and
 on-demand wake-up as described below.
 
@@ -516,8 +517,9 @@ vestridynamic sync
   remain reserved and can be retried by name. Operator diagnostic logs retain
   request UUIDs for untyped console retries and backend correlation; player
   chat never includes those UUIDs.
-- `spawn ... --send-player <player name>` first checks that the player is online
-  on this proxy, then spawns normally. After the API returns, it waits up to five
+- For ordinary templates, `spawn ... --send-player <player name>` first checks
+  that the player is online on this proxy, then spawns normally. After the API
+  returns, it waits up to five
   minutes for that exact instance to appear in Velocity and answer a Minecraft
   status ping. It retries readiness checks every two seconds, with a five-second
   maximum for each ping. Successful checks must span at least six seconds before
@@ -533,6 +535,8 @@ vestridynamic sync
   Instance UUIDs and transient retry diagnostics stay in the proxy console.
   Plain spawn behavior is
   unchanged when the flag is omitted. The flag is only valid for `spawn`.
+  For minigame templates, this readiness wait alone does not authorize entry;
+  see **Direct Instance Joins** below.
 - `list` shows server UUIDs accessible to the configured template key.
 - `delete` stops the instance, unregisters it, and permanently removes its files
   and record. `--confirm` is mandatory. Without `--instance`, exactly one instance
@@ -734,8 +738,9 @@ after deploying the updated JAR to both the proxy and the NPC's backend.
 
 The Velocity entry point provides transient parties and template-based minigame
 queues. The Paper entry point coordinates readiness, roster admission, startup
-commands, and end signals for each generated match server. This is separate from
-player-owned permanent/temporary servers and plain console spawning.
+commands, and end signals for each generated match server. Minigame
+`instanceMode` is separate from player-owned permanent/temporary servers and
+the console's ownership opt-in `--type`.
 
 ### Player Commands and Membership
 
@@ -772,6 +777,41 @@ Changing membership or disconnecting invalidates that group's queued entry;
 the remaining players must queue again. `/minigame leave` withdraws a queue entry
 or cancels a match still joining/starting, not a running game's gameplay session.
 
+### Direct Instance Joins
+
+A dashboard/web spawn creates a server, **not a player roster**. In
+`lobbyMode: vestri`, players must use `/minigame join <template>`; `minPlayers`
+remains the queue threshold even when a manually spawned instance is ready.
+The command reports that the group is queued. Until the threshold is met and
+the roster is assigned, an ordinary server connection cannot enter it.
+
+The earlier manual-join failure came from attempting an ordinary transfer
+without satisfying the minigame roster gate. A running server or successful ping
+does not authorize entry. The current implementation routes a direct
+native-lobby server request from a player already connected to a backend, and
+console `spawn ... --send-player`, through minigame admission for the **exact
+requested instance**, not another server from the template's pool.
+
+Native admission enforces participant permissions, party leadership and whole
+party capacity, waits for a fresh agent report, and applies a full roster update.
+Paper must acknowledge the matching match ID and `rosterVersion` before Velocity
+connects the admitted players. An ordinary ping is never a roster bypass.
+Specific-instance readiness waits are bounded to 300 seconds; a full or
+unavailable target reports the failure rather than silently choosing another
+instance. `vestri.minigames` is required for each participant, including console
+minigame admissions; trusted console ownership spawning is a separate feature.
+
+For managed lobbies, console `--send-player` enters the normal template queue
+and reports that it is waiting for `minPlayers`, with `/minigame join` guidance;
+it does not force entry to the spawned instance. Ordinary non-roster connections
+remain denied. Use `/minigame join <template>` for the managed workflow.
+
+Manifest reconciliation adopts each manually created minigame instance
+independently. It matches a pending preparation only by slug, server ID, or the
+same caller `spawnRequestId` and template; sharing a template does not merge a
+manual instance with another pending spawn. Adoption tracks the server but does
+not assign players or grant owned-server access.
+
 ### Template Settings and Startup Commands
 
 Create or edit a saved template in the dashboard's **minigame mode**, linked to
@@ -796,6 +836,7 @@ mode: minigames
 maxInstances: 4
 minigame:
   lobbyMode: vestri
+  instanceMode: temporary
   teams: [red, blue]
   teamSize: 2
   minPlayers: 2
@@ -851,6 +892,7 @@ mode: minigames
 maxInstances: 4
 minigame:
   lobbyMode: plugin
+  instanceMode: temporary
   teams: []
   minPlayers: 1
   maxPlayers: 8
@@ -876,7 +918,40 @@ Velocity transfers the newly admitted players. Existing players are not sent
 again, and pending admissions must finish before another roster addition.
 The initial acknowledgement enters running state without a Vestri startup phase;
 later admissions remain in that state. `joinTimeout` bounds acknowledgement and
-joining, with cancellation/cleanup on failure.
+joining. Temporary instances cancel and clean up on failure; permanent instances
+release failed reservations without deleting the server, as described below.
+
+`instanceMode` defaults to `temporary`, including older saved specifications
+without this field. Use `instanceMode: permanent` **only with
+`lobbyMode: plugin`** for a long-lived native lobby. Its `onAllJoined` must be
+empty; end settings must have `deleteServer: false`, `whenEmpty: false`, and an
+absent or empty `logPattern`. For example, change the native example above to:
+
+```yaml
+instanceMode: permanent
+lifecycle:
+  ready:
+    trigger: serverLoad
+  onAllJoined: []
+  end:
+    returnPlayersTo: lobby
+    deleteServer: false
+    whenEmpty: false
+```
+
+Permanent instances are not automatically deleted on game end or when empty.
+Paper ignores their explicit end signal. Failures, stale heartbeats, or
+incompatible template changes can mark them unavailable rather than delete
+them; fresh valid agent reports are required for recovery. Explicit dashboard
+deletion still removes them.
+
+After a permanent admission completes, a departure confirmed absent by both
+Paper and Velocity removes the player from the dynamic roster and frees
+capacity. Removal increments `rosterVersion`; Paper must acknowledge the updated
+full roster before capacity is reused for another admission. Existing members
+keep their identities and assignments. An expired admission releases and, where
+still valid, requeues the failed whole group without removing established
+players or deleting the instance.
 
 Vestri does not impose an explicit game-start admission lock in plugin mode.
 The gameplay plugin controls whether its game state permits a join, including
@@ -900,8 +975,11 @@ or partially requeued. The startup phase also has a bounded acknowledgement wait
 
 ### Readiness, Pool Capacity, and End Signals
 
-`readyServers` is a **count** of spare empty ready servers to maintain, not a list
-of server names. Confirmed readiness requires the Paper agent's ready report with
+`readyServers` is a **count**, not a list of names. Temporary mode targets spare
+empty ready servers. Permanent mode targets the minimum **total permanent
+instance count**, including reserved, running, and unavailable instances, not
+spares. Reserving a permanent lobby does not replenish a spare pool.
+Confirmed readiness requires the Paper agent's ready report with
 no match and no players, not merely a running container or a Minecraft status
 ping. Provisioning instances count as credits toward that pool target so each
 sweep does not create duplicate replacements. All tracked instances, including
@@ -921,49 +999,129 @@ vestridynamic end
 
 These are local minigame-agent signals, not proxy lifecycle commands and not
 player commands. `ready` signals application readiness; `end` explicitly ends
-the match. The configured `logPattern` is a Java regular expression applied only
+a temporary match and is ignored for permanent instances. The configured
+`logPattern` is a Java regular expression applied only
 to **JUL (`java.util.logging`) log messages** while running. It is not a general
 console-output, stdout, Log4j, or SLF4J scraper. If a gameplay plugin does not emit
 the matching message through JUL, integrate a manual/plugin adapter that issues
-the explicit `vestridynamic end` command. `whenEmpty` optionally ends an empty
-running match after `emptyGrace`. End handling returns players to the exact
+the explicit `vestridynamic end` command. In temporary mode, `whenEmpty` optionally
+ends an empty running match after `emptyGrace`. Temporary end handling returns
+players to the exact
 Velocity registry name in `returnPlayersTo`, then deletes the empty instance;
 an unavailable lobby or failed return can disconnect players instead.
 
-### Durable State and Deployment
+### Durable State
 
 The proxy atomically persists provisioning, ready, and active instance records
-in `plugins/vestri-dynamic/vestri-minigames.json`. On proxy restart, active
+in `plugins/vestri-dynamic/vestri-minigames.json`. On proxy restart, temporary active
 joining/starting/running records are cancelled and scheduled for evacuation and
-cleanup, **not resumed or replayed**. Provisioning/ready records remain tracked
-for reconciliation. Cleanup failures retain records for retry rather than
+cleanup, **not resumed or replayed**. Permanent native instances retain their
+match and roster across proxy restarts and recover from fresh agent reports;
+pending admissions remain bounded by the join timeout. Provisioning/ready
+records remain tracked for reconciliation. Cleanup failures retain records for retry rather than
 forgetting instances. Persist this ledger alongside the existing proxy files;
 do not remove it to reset a queue or edit it while running. Invalid ledgers fail
 closed to avoid duplicate provisioning.
+
+The protected proxy ledger pins the original API origin (the configured
+`backendUrl`, including any deployment prefix) and template API key for each
+preparation/instance. Retries, lookup, and cleanup use that saved credential
+binding, not a replacement key or origin from the current configuration.
+Changing the config does not transfer backend ownership or repair a revoked,
+expired, or unauthorized pinned key. On POSIX filesystems, protect the ledger
+with file mode `0600` and its directory with `0700`; it contains sensitive
+credentials, as do backups. Legacy records whose original credentials are
+unknown remain tracked and fail closed: do not silently forget them, substitute
+a current key, or remove the ledger to bypass recovery. Resolve their original
+credentials or use authorized dashboard deletion and authoritative proxy sync.
 
 Each generated Paper instance receives
 `plugins/VestriConsoleBridge/minigame.json` and maintains its durable execution
 ledger/fence at `plugins/VestriConsoleBridge/minigame-execution.json`. The fence
 binds a match ID and roster and records the startup claim **before** dispatching
-actions. Restarting after that claim fails the agent instead of executing startup
-commands again, including after a crash partway through the command list. This
+actions. For temporary instances, restarting after that claim fails the agent
+instead of executing startup commands again, including after a crash partway
+through the command list. This
 prevents startup replay; it does not roll back commands or promise exactly-once
 completion of their external effects. Preserve existing instance fences on
 retries/restarts, but do not bake a used instance's fence into a reusable template.
 
+Permanent native Paper instances restore their durable match and dynamic roster
+instead of aborting solely because of a startup claim. Recovery requires the
+original generated credentials/configuration and execution fence: the permanent
+fence validates its credential binding and rejects another instance's
+credentials. Retain the original template API key for backend operations too.
+This does not restore the gameplay plugin's own state or automatically reconnect
+players.
+
+Offline recovery is supported for permanent native instances: persisted roster
+reservations survive proxy/Paper restarts even when their players are offline.
+Fresh matching agent reports and roster acknowledgements reconcile those
+reservations; absence confirmed by both Paper and Velocity releases departed
+players and requires the updated roster acknowledgement before capacity reuse.
+Transient parties and queues are still not restored, and recovery does not
+automatically transfer offline players or relax the admission handshake.
+
+### Dashboard Deletion and Cleanup Recovery
+
+Dashboard instance deletion uses the backend's instance deletion path. After
+files and the database record are deleted, the backend publishes a complete
+authoritative proxy snapshot and triggers synchronization with an independent
+30-second timeout. Template creation/deletion also synchronize after commit.
+An authoritative snapshot retires previously bound ledger entries whose server
+IDs are missing, evacuates remaining known occupants, and removes local tracking
+without another template-key deletion. A non-authoritative snapshot cannot
+prove deletion and does not retire entries. Unmatched, unbound pending
+preparations are not discarded merely because they are absent.
+
+If post-commit synchronization fails, the API returns HTTP **502** with
+`committed: true`: the mutation is committed, not rolled back. A node
+administrator can retry authoritative synchronization through
+`POST /api/nodes/{nodeRef}/minecraft/proxies/{proxyRef}/sync`. Retry that sync,
+not template creation or deletion. Proxy console `vestridynamic sync` only reads
+the local manifest; it does not regenerate it from the backend database.
+
+Automatic cleanup uses the pinned original API origin and template key. For a
+dashboard-created **minigame**, known-ID lifecycle operations also allow a key
+whose creator is exactly the dashboard server's creator, with matching node and
+template and current node owner/admin permission. This is narrow delegation,
+not authority for every key on that template: a different creator account gets
+HTTP 403. Ordinary dashboard instances remain excluded, and exact-key isolation
+for API-created instances, list, and request lookup is unchanged. Adoption of a
+manual/web minigame does not itself establish cleanup authorization.
+An absent instance (HTTP 404)
+is treated as already deleted; HTTP 403 is **not blanket-ignored** because it
+can mean the instance belongs to another key. Lookup/deletion failures retain
+the record and log `Minigame cleanup pending` with template, instance ID, request
+UUID, exception class, and sanitized error detail. Cleanup retries use a
+**60-second backoff**. Only a valid authoritative snapshot establishes external
+deletion independently of template-key access.
+
+### Deployment
+
 Deploy the updated **backend first**, then the new plugin JAR on **Velocity and
-the Paper templates** used for minigames, restarting the proxy and applicable
+the Paper templates and current Paper instances** used for minigames, restarting the proxy and applicable
 servers to load it. Updating only Velocity is insufficient; existing template
 JARs must also be updated so newly generated instances have the agent. Maintain
 the manually configured template keys so provisioning and cleanup remain usable.
 
+Deploy the updated frontend as well so newly generated template specs contain
+the intended `instanceMode`, lobby, and lifecycle settings; regenerate and verify
+the spec before creating replacement instances. Resynchronize the proxy after
+deployment or template changes. A current instance uses its pinned spawn-time
+spec copy: changing a template or regenerating its spec cannot change that
+instance's mode in place. A temporary instance cannot become permanent by a
+template edit or a JAR update; recreate it with the intended spec.
+
 Templates and provisioning jobs retain saved configuration snapshots; changing
 the template does not rewrite an old job or automatically upgrade a current
 match instance. For recovery, upgrade the backend, Velocity, and Paper template
-JARs together, then stop and recreate old matches through operator-managed
-evacuation and cleanup. Retain the original request UUID after preparation
-failure so retries reconcile the same instance. Do not manually delete either
-ledger to force provisioning or bypass an execution fence.
+JARs together, then stop and recreate incompatible old temporary matches through
+operator-managed evacuation and cleanup. Retain the original request UUID after preparation
+failure so retries reconcile the same instance. Compatible permanent instances
+can recover across restarts with original credentials and durable files; do not
+treat them as temporary matches that must always be recreated. Do not manually
+delete either ledger to force provisioning or bypass an execution fence.
 
 ### Preparation and Agent Diagnostics
 
@@ -973,6 +1131,13 @@ redacted message and retains the same request for retry. An `IOException` alone
 does not identify the live failure's root cause; a preflight
 `VESTRI_DYNAMIC_SYNC_OK` is manifest-only confirmation, not spawn readiness.
 
+Current live retry or cleanup failures may be rooted in the pinned original
+credentials or origin: check key expiry/revocation, creator/node permissions,
+template binding, and reachability of that saved origin. A working replacement
+key in the current config does not prove the pinned credentials work. Correlate
+the actual HTTP status and sanitized backend/worker logs before assigning a
+root cause; never print keys or publish the ledger to diagnose it.
+
 Check Paper's startup configuration log to confirm the minigame agent loaded its
 generated configuration. Missing or invalid configuration/execution fences are
 reported separately and deny entry. `Minigame control unavailable` reports an
@@ -981,8 +1146,8 @@ bodies; repeated warnings are rate-limited to once per 30 seconds, and recovery
 is logged. Velocity's `Minigame startup stalled` warning means no agent report
 arrived after 30 seconds: inspect Paper startup and agent configuration, then
 verify private proxy DNS and port 25580 reachability from that instance.
-Connection-result/reason diagnostics are being added on `main`; when available
-in the deployed build, use them to distinguish failed transfers from a gameplay
+The current implementation logs connection results/reasons; deploy the updated
+JAR before relying on them to distinguish failed transfers from a gameplay
 plugin's login rejection. Do not infer a successful connection from a roster
 acknowledgement alone. These diagnostics do not establish that the root cause
 of an uncorrelated live preparation error has been fixed.
@@ -1000,7 +1165,10 @@ configuration. Verify that the generated hostname resolves to the proxy containe
 and that HTTP is reachable from the match container on your deployment. This is
 private agent-to-proxy HTTP, distinct from `backendUrl` and the Minecraft port.
 
-This section documents the implementation and deployment requirements, not a
-claim of live testing. Validate private DNS/HTTP reachability, readiness signals,
-gameplay command integration, no-show cancellation, and restart cleanup on your
+Deployment and restarts are operator actions; this documentation update does not
+deploy a JAR or automatically restart Velocity or Paper. This section documents
+the current implementation and deployment requirements, not a claim of live
+testing. Validate private DNS/HTTP reachability,
+readiness signals, gameplay command integration, no-show cancellation,
+permanent restart recovery, and temporary restart cleanup on your
 own deployment before opening queues to players.

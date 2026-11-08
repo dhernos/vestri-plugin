@@ -9,7 +9,7 @@ import java.util.regex.Pattern;
 
 record MinigameSpec(List<String> teams, int teamSize, int minPlayers, int maxPlayers,
                     long joinTimeout, int readyServers, int maxInstances, boolean whenEmpty,
-                    long emptyGrace, String fallback, String lobbyMode) {
+                    long emptyGrace, String fallback, String lobbyMode, boolean permanent) {
     boolean teamfree() {
         return teams.isEmpty();
     }
@@ -25,6 +25,8 @@ record MinigameSpec(List<String> teams, int teamSize, int minPlayers, int maxPla
         }
         int teamSize = json.has("teamSize") ? json.get("teamSize").getAsInt() : 0;
         String lobbyMode = json.has("lobbyMode") ? json.get("lobbyMode").getAsString() : "vestri";
+        String instanceMode = json.has("instanceMode") ? json.get("instanceMode").getAsString() : "temporary";
+        boolean permanent = instanceMode.equals("permanent");
         int minimum = json.get("minPlayers").getAsInt();
         int maximum = json.get("maxPlayers").getAsInt();
         int ready = json.get("readyServers").getAsInt();
@@ -35,14 +37,17 @@ record MinigameSpec(List<String> teams, int teamSize, int minPlayers, int maxPla
                 || teams.stream().anyMatch(team -> !team.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}"))
             || teamSize < 0 || teamSize > 100 || !teams.isEmpty() && (teamSize < 1 || maximum > teams.size() * teamSize)
             || !List.of("vestri", "plugin").contains(lobbyMode)
+            || !List.of("temporary", "permanent").contains(instanceMode)
+            || permanent && (!lobbyMode.equals("plugin") || end.get("deleteServer").getAsBoolean()
+                || end.get("whenEmpty").getAsBoolean())
             || minimum < 1 || minimum > maximum || maximum > 100
             || limit < 1 || limit > 100 || ready < 0 || ready > limit
-                || !fallback.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}") || !end.get("deleteServer").getAsBoolean()) {
+                || !fallback.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}") || !permanent && !end.get("deleteServer").getAsBoolean()) {
             throw new IllegalArgumentException("Invalid minigame template settings");
         }
         return new MinigameSpec(List.copyOf(teams), teamSize, minimum, maximum,
                 duration(json.get("joinTimeout").getAsString()), ready, limit,
-                end.get("whenEmpty").getAsBoolean(), duration(end.get("emptyGrace").getAsString()), fallback, lobbyMode);
+                end.get("whenEmpty").getAsBoolean(), duration(end.get("emptyGrace").getAsString()), fallback, lobbyMode, permanent);
     }
 
     static long duration(String text) {

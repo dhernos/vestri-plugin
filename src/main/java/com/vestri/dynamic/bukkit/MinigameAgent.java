@@ -95,12 +95,13 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         this.plugin = plugin;
         this.config = config;
         this.diagnostics = diagnostics;
-        fence = new MatchFence(execution, config.teams(), config.lobbyMode());
+        fence = new MatchFence(execution, config.teams(), config.lobbyMode(), config.instanceMode(),
+            config.permanent() ? credentialBinding(config) : null);
         if (fence.roster() != null) {
             roster = fence.roster();
             allowed = Set.copyOf(roster.stream().map(Member::uuid).toList());
         }
-        if (fence.startupClaimed()) {
+        if (fence.startupClaimed() && !config.permanent()) {
             state = "failed";
         }
         client = HttpClient.newBuilder().executor(httpExecutor).connectTimeout(Duration.ofSeconds(2))
@@ -176,7 +177,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
 
     void observeLog(String message) {
-        if (!closed && state.equals("running") && config.endPattern() != null && message != null
+        if (!config.permanent() && !closed && state.equals("running") && config.endPattern() != null && message != null
                 && message.length() <= 4096 && config.endPattern().matcher(message).find()) {
             endRequested.set(true);
         }
@@ -201,6 +202,10 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
 
     public void end() {
+        if (config.permanent()) {
+            diagnostics.logger.info("Permanent native minigame end ignored; the instance remains active.");
+            return;
+        }
         if (!closed && !terminal()) {
             state = "ended";
         }
@@ -294,7 +299,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
             Control parsed;
             try {
-                parsed = control(new String(response.body(), StandardCharsets.UTF_8), config.teams());
+                parsed = control(new String(response.body(), StandardCharsets.UTF_8), config.teams(), config.instanceMode());
             } catch (RuntimeException failure) {
                 diagnostics.failure("invalid response class=" + failure.getClass().getSimpleName());
                 return null;
@@ -410,6 +415,11 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         if (!Set.of("vestri", "plugin").contains(lobbyMode)) {
             throw new IllegalArgumentException();
         }
+        String instanceMode = spec.has("instanceMode") ? string(spec.get("instanceMode")) : "temporary";
+        if (!Set.of("temporary", "permanent").contains(instanceMode)
+                || (instanceMode.equals("permanent") && !lobbyMode.equals("plugin"))) {
+            throw new IllegalArgumentException();
+        }
         List<String> teams = new ArrayList<>();
         JsonArray definitions = spec.has("teams") && !spec.get("teams").isJsonNull()
             ? spec.getAsJsonArray("teams") : null;
@@ -457,18 +467,43 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             throw new IllegalArgumentException();
         }
         JsonObject end = lifecycle.getAsJsonObject("end");
+        if (instanceMode.equals("permanent") && (!actions.isEmpty() || end == null || end.has("logPattern")
+                || !explicitFalse(end, "deleteServer") || !explicitFalse(end, "whenEmpty"))) {
+            throw new IllegalArgumentException("Invalid permanent native lifecycle");
+        }
         String pattern = end != null && end.has("logPattern") ? end.get("logPattern").getAsString() : "";
         if (pattern.getBytes(StandardCharsets.UTF_8).length > 512 || pattern.contains("\n") || pattern.contains("\r")) {
             throw new IllegalArgumentException();
         }
         return new Configuration(URI.create(url.replaceAll("/$", "") + "/minigame/" + slug), token,
-            List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern), lobbyMode);
+            List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern), lobbyMode, instanceMode);
+    }
+
+    private static boolean explicitFalse(JsonObject object, String key) {
+        var value = object.get(key);
+        return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isBoolean()
+                && !value.getAsBoolean();
+    }
+
+    private static String credentialBinding(Configuration config) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(
+                    (config.endpoint() + "\n" + config.token()).getBytes(StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException failure) {
+            throw new IllegalStateException(failure);
+        }
     }
 
     static Control control(String text, List<String> teams) {
+        return control(text, teams, "temporary");
+    }
+
+    static Control control(String text, List<String> teams, String instanceMode) {
         JsonObject root = JsonParser.parseString(text).getAsJsonObject();
         String state = root.get("state").getAsString();
-        if (!Set.of("ready", "joining", "starting", "running", "ending").contains(state)) {
+        if (!Set.of("ready", "joining", "starting", "running", "ending").contains(state)
+                && !(instanceMode.equals("permanent") && state.equals("unavailable"))) {
             throw new IllegalArgumentException();
         }
         UUID matchId = root.has("matchId") && !root.get("matchId").isJsonNull()
@@ -572,7 +607,24 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
     record Report(String state, UUID matchId, List<String> players, int rosterVersion) { }
     record Configuration(URI endpoint, String token, List<String> teams, String trigger,
-            List<Action> actions, Pattern endPattern, String lobbyMode) {
+            List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode) {
+        Configuration {
+            if (!Set.of("temporary", "permanent").contains(instanceMode)
+                    || (instanceMode.equals("permanent") && (!lobbyMode.equals("plugin")
+                            || !actions.isEmpty() || endPattern != null))) {
+                throw new IllegalArgumentException("Invalid instance mode");
+            }
+        }
+
+        boolean permanent() {
+            return instanceMode.equals("permanent");
+        }
+
+        Configuration(URI endpoint, String token, List<String> teams, String trigger,
+                List<Action> actions, Pattern endPattern, String lobbyMode) {
+            this(endpoint, token, teams, trigger, actions, endPattern, lobbyMode, "temporary");
+        }
+
         Configuration(URI endpoint, String token, List<String> teams, String trigger,
                 List<Action> actions, Pattern endPattern) {
             this(endpoint, token, teams, trigger, actions, endPattern, "vestri");
@@ -583,6 +635,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         private final Path path;
         private final List<String> teams;
         private final String lobbyMode;
+        private final String instanceMode;
+        private final String credentialBinding;
         private UUID matchId;
         private boolean startupClaimed;
         private List<Member> roster;
@@ -593,9 +647,19 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
 
         MatchFence(Path path, List<String> teams, String lobbyMode) throws IOException {
+            this(path, teams, lobbyMode, "temporary", null);
+        }
+
+        MatchFence(Path path, List<String> teams, String lobbyMode, String instanceMode,
+                String credentialBinding) throws IOException {
             this.path = path;
             this.teams = List.copyOf(teams);
             this.lobbyMode = lobbyMode;
+            this.instanceMode = instanceMode;
+            this.credentialBinding = credentialBinding;
+            if (instanceMode.equals("permanent") && (!lobbyMode.equals("plugin") || credentialBinding == null)) {
+                throw new IllegalArgumentException("Invalid permanent fence");
+            }
             if (Files.exists(path)) {
                 byte[] bytes;
                 try (var input = Files.newInputStream(path)) {
@@ -605,6 +669,11 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                     throw new IOException("Execution fence exceeds size limit");
                 }
                 JsonObject saved = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
+                if ((saved.has("instanceMode") && !instanceMode.equals(string(saved.get("instanceMode"))))
+                    || (instanceMode.equals("permanent") && (!saved.has("credentialBinding")
+                        || !credentialBinding.equals(string(saved.get("credentialBinding")))))) {
+                    throw new IllegalArgumentException("Execution fence belongs to another instance");
+                }
                 var claimed = saved.get("startupClaimed");
                 if (claimed == null || !claimed.isJsonPrimitive() || !claimed.getAsJsonPrimitive().isBoolean()) {
                     throw new IllegalArgumentException("Invalid execution claim");
@@ -670,9 +739,14 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             List<Member> updated = List.copyOf(members);
             if (roster != null) {
                 if (version <= rosterVersion) {
+                    if (instanceMode.equals("permanent") && version < rosterVersion) {
+                        return false;
+                    }
                     return roster.size() == updated.size() && updated.containsAll(roster);
                 }
-                if (!updated.containsAll(roster)) {
+                if (instanceMode.equals("permanent") ? updated.stream().anyMatch(member -> roster.stream()
+                        .anyMatch(previous -> previous.uuid().equals(member.uuid()) && !previous.equals(member)))
+                        : !updated.containsAll(roster)) {
                     return false;
                 }
             }
@@ -701,7 +775,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             Path temporary = null;
             try {
                 Files.createDirectories(path.getParent());
-                byte[] bytes = JSON.toJson(new Execution(candidate, claimed, members, version)).getBytes(StandardCharsets.UTF_8);
+                byte[] bytes = JSON.toJson(new Execution(candidate, claimed, members, version, instanceMode,
+                    credentialBinding)).getBytes(StandardCharsets.UTF_8);
                 if (bytes.length > MAX_BYTES) {
                     throw new IOException("Execution fence exceeds size limit");
                 }
@@ -729,7 +804,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
         }
 
-        private record Execution(UUID matchId, boolean startupClaimed, List<Member> roster, int rosterVersion) { }
+        private record Execution(UUID matchId, boolean startupClaimed, List<Member> roster, int rosterVersion,
+            String instanceMode, String credentialBinding) { }
     }
 
     static final class BoundedBody implements HttpResponse.BodySubscriber<byte[]> {
