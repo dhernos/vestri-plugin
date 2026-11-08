@@ -725,3 +725,193 @@ correlated backend/worker logs; fake API tests verify recovery, not a claim that
 every worker or network failure is eliminated. Validate
 actual container startup, proxy forwarding, and NPC interaction on your network
 after deploying the updated JAR to both the proxy and the NPC's backend.
+
+## Parties and Minigames
+
+The Velocity entry point provides transient parties and template-based minigame
+queues. The Paper entry point coordinates readiness, roster admission, startup
+commands, and end signals for each generated match server. This is separate from
+player-owned permanent/temporary servers and plain console spawning.
+
+### Player Commands and Membership
+
+Run these as players on the proxy:
+
+```text
+/party invite Friend
+/party accept Leader
+/party leave
+/party kick Friend
+/party list
+/party disband
+/party leader Friend
+/minigame join Arena
+/minigame leave
+/minigame list
+```
+
+Invitations require acceptance; the leader invites, kicks, disbands, or transfers
+leadership with `/party leader <member>`. Party membership and invitations are
+in memory only. Disconnecting removes the player from their party; if the leader
+leaves or disconnects, a remaining member is elected. A proxy restart discards
+all parties, invitations, and queues. These are not persistent server invitations.
+
+Grant the exact Velocity permission `vestri.minigames` to every participant.
+The party leader queues or leaves for the whole group; a player without a party
+queues as a one-player group. `/minigame join <template>` takes a template, **not
+a player argument**. All members must be connected, permitted, and neither queued
+nor playing elsewhere. Parties must fit within `teamSize` and `maxPlayers`.
+Changing membership or disconnecting invalidates that group's queued entry;
+the remaining players must queue again. `/minigame leave` withdraws a queue entry
+or cancels a match still joining/starting, not a running game's gameplay session.
+
+### Template Settings and Startup Commands
+
+Create or edit a saved template in the dashboard's **minigame mode**, linked to
+the intended Velocity proxy. Configure teams, player limits, the ready-server
+pool, readiness, startup actions, and end behavior there. Minigame templates are
+discovered through the backend-generated proxy manifest, including templates
+with no instances yet. API keys are still configured **manually**: issue a
+template-scoped Minecraft API key for each template and add it to the same
+`templates` map in `plugins/vestri-dynamic/vestri-dynamic-config.json`. Keep aliases
+equal to the dashboard template names for matchmaking. Use the existing
+`backendUrl` setting and routing rules described above; this is not a second API
+configuration, and no player name is stored in it. Do not put template API keys
+in Paper configs.
+
+This YAML illustrates the saved-template settings represented by the dashboard;
+it is **not** a file to place in the plugin directory. The backend stores these
+settings as JSON. Retain the template's existing base, world, plugin, and proxy
+references when applying them:
+
+```yaml
+mode: minigames
+maxInstances: 4
+minigame:
+  teams: [red, blue]
+  teamSize: 2
+  minPlayers: 2
+  maxPlayers: 4
+  joinTimeout: 20s
+  readyServers: 1
+  lifecycle:
+    ready:
+      trigger: explicit
+    onAllJoined:
+      - command: "team add {team}"
+        forEach: team
+      - command: "team join {team} {player}"
+        forEach: player
+      - command: "say Match {matchId} ready"
+    end:
+      logPattern: '^MATCH_END$'
+      whenEmpty: true
+      emptyGrace: 10s
+      returnPlayersTo: lobby
+      deleteServer: true
+```
+
+These are illustrative Minecraft console commands, without leading slashes.
+Use a template without preexisting `red`/`blue` scoreboard teams for this example;
+replace the final `say` with the installed gameplay plugin's actual start command
+when appropriate. The bridge does not implement that plugin's game rules.
+
+An action without `forEach` runs once and can use `{matchId}`. `forEach: team`
+runs once per configured team and can also use `{team}`. `forEach: player` runs
+once per roster player and can use `{player}`, `{uuid}`, and `{team}` as well as
+`{matchId}`. Here `{player}` is the roster's Minecraft name, not an NPC placeholder.
+The proxy precomputes team assignments while preserving whole parties on one
+team; the per-player action uses that assignment, rather than choosing teams
+again on Paper. `{player}` and `{uuid}` are invalid outside player scope, and
+`{team}` requires team or player scope.
+
+Startup actions run only after the entire assigned roster has joined. Actions
+and their repetitions are dispatched in configured order; a rejected command
+fails startup and stops later commands. **Command ordering is not an asynchronous
+completion guarantee**: a command returning successfully can still have work in
+flight. Use a gameplay-plugin adapter or explicit signal when initialization must
+finish before the next phase, rather than assuming sequential commands await it.
+
+`joinTimeout` is the maximum roster-join wait after the server acknowledges its
+assignment. A no-show or joining/starting timeout cancels the match, returns
+present players, and schedules instance cleanup. Only intact groups whose exact
+membership is still connected and permitted are automatically requeued; a group
+with a disconnected member or changed leadership/membership is not reconstructed
+or partially requeued. The startup phase also has a bounded acknowledgement wait.
+
+### Readiness, Pool Capacity, and End Signals
+
+`readyServers` is a **count** of spare empty ready servers to maintain, not a list
+of server names. Confirmed readiness requires the Paper agent's ready report with
+no match and no players, not merely a running container or a Minecraft status
+ping. Provisioning instances count as credits toward that pool target so each
+sweep does not create duplicate replacements. All tracked instances, including
+active matches and pending cleanup, count toward the template's `maxInstances`
+cap; backend node/template limits still apply. Queued demand can provision a
+server even with `readyServers: 0`, subject to those limits.
+
+With `ready.trigger: serverLoad`, the Paper server-load event schedules readiness.
+Use `explicit` when a gameplay plugin must finish initialization first, then run
+the following in the **generated Paper match server's console** (the console
+equivalents of `/vestridynamic ready` and `/vestridynamic end`):
+
+```text
+vestridynamic ready
+vestridynamic end
+```
+
+These are local minigame-agent signals, not proxy lifecycle commands and not
+player commands. `ready` signals application readiness; `end` explicitly ends
+the match. The configured `logPattern` is a Java regular expression applied only
+to **JUL (`java.util.logging`) log messages** while running. It is not a general
+console-output, stdout, Log4j, or SLF4J scraper. If a gameplay plugin does not emit
+the matching message through JUL, integrate a manual/plugin adapter that issues
+the explicit `vestridynamic end` command. `whenEmpty` optionally ends an empty
+running match after `emptyGrace`. End handling returns players to the exact
+Velocity registry name in `returnPlayersTo`, then deletes the empty instance;
+an unavailable lobby or failed return can disconnect players instead.
+
+### Durable State and Deployment
+
+The proxy atomically persists provisioning, ready, and active instance records
+in `plugins/vestri-dynamic/vestri-minigames.json`. On proxy restart, active
+joining/starting/running records are cancelled and scheduled for evacuation and
+cleanup, **not resumed or replayed**. Provisioning/ready records remain tracked
+for reconciliation. Cleanup failures retain records for retry rather than
+forgetting instances. Persist this ledger alongside the existing proxy files;
+do not remove it to reset a queue or edit it while running. Invalid ledgers fail
+closed to avoid duplicate provisioning.
+
+Each generated Paper instance receives
+`plugins/VestriConsoleBridge/minigame.json` and maintains its durable execution
+ledger/fence at `plugins/VestriConsoleBridge/minigame-execution.json`. The fence
+binds a match ID and roster and records the startup claim **before** dispatching
+actions. Restarting after that claim fails the agent instead of executing startup
+commands again, including after a crash partway through the command list. This
+prevents startup replay; it does not roll back commands or promise exactly-once
+completion of their external effects. Preserve existing instance fences on
+retries/restarts, but do not bake a used instance's fence into a reusable template.
+
+Deploy the updated **backend first**, then the new plugin JAR on **Velocity and
+the Paper templates** used for minigames, restarting the proxy and applicable
+servers to load it. Updating only Velocity is insufficient; existing template
+JARs must also be updated so newly generated instances have the agent. Maintain
+the manually configured template keys so provisioning and cleanup remain usable.
+
+The proxy's private control HTTP listener binds port **25580**. Allow generated
+Paper instances to reach it on the private Docker network, but **do not publicly
+publish this port**, add public reverse-proxy routing, or expose it to players.
+Generated per-instance bearer tokens authorize the bound server/slug; they are
+not player credentials, template API keys, or the console bridge secret.
+Protect the generated config and proxy manifest as secrets.
+
+Currently the generated `controlUrl` uses `http://vestri-<parent Docker root>:25580`
+for the parent proxy. Check that this alias resolves to the proxy container from
+the match containers; do not assume a separate `main` alias is already used. A
+later backend change may use a corrected main-container alias. This address is
+private agent-to-proxy HTTP, distinct from `backendUrl` and the Minecraft port.
+
+This section documents the implementation and deployment requirements, not a
+claim of live testing. Validate private DNS/HTTP reachability, readiness signals,
+gameplay command integration, no-show cancellation, and restart cleanup on your
+own deployment before opening queues to players.

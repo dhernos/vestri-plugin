@@ -127,6 +127,38 @@ class PlayerServersTest {
     }
 
     @Test
+    void fullPreConnectWiringPreservesOwnedServerAclWithMinigamesPresent() throws Exception {
+        var entry = entry(OwnedServerRegistry.Type.PERMANENT);
+        Player guest = guest("Guest");
+        var plugin = new VestriDynamicServers(proxy, mock(Logger.class), directory);
+        var playerServers = VestriDynamicServers.class.getDeclaredField("playerServers");
+        playerServers.setAccessible(true);
+        playerServers.set(plugin, service);
+        try (var minigames = new Minigames(proxy, new Parties(), directory, mock(Logger.class), clock::get)) {
+            var minigamesField = VestriDynamicServers.class.getDeclaredField("minigames");
+            minigamesField.setAccessible(true);
+            minigamesField.set(plugin, minigames);
+            var continuation = mock(com.velocitypowered.api.event.Continuation.class);
+            var denied = new ServerPreConnectEvent(guest, target);
+            plugin.beforeServerConnect(denied).execute(continuation);
+            assertTrue(denied.getResult().getServer().isEmpty());
+            assertEquals(0, entry.joinUntil);
+            service.execute(invocation("invite", "Survival-1", "Guest"));
+            var allowed = new ServerPreConnectEvent(guest, target);
+            plugin.beforeServerConnect(allowed).execute(continuation);
+            assertEquals(java.util.Optional.of(target), allowed.getResult().getServer());
+            assertTrue(entry.joinUntil > clock.get());
+            service.execute(invocation("revoke", "Survival-1", "Guest"));
+            var revoked = new ServerPreConnectEvent(guest, target);
+            plugin.beforeServerConnect(revoked).execute(continuation);
+            assertTrue(revoked.getResult().getServer().isEmpty());
+            verify(continuation, times(3)).resume();
+            verify(continuation, never()).resumeWithException(any());
+            assertTrue(calls.isEmpty());
+        }
+    }
+
+    @Test
     void spawnSendsOnlyOneBlueStartingAnnouncement() {
         service.execute(invocation("spawn", "temporary", "Survival"));
         var captured = ArgumentCaptor.forClass(Component.class);

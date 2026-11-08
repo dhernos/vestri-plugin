@@ -47,6 +47,9 @@ public final class VestriDynamicServers {
     private final ConsoleBridgeProtocol consoleBridge = new ConsoleBridgeProtocol();
     private PlayerServers playerServers;
     private PlayerManagement playerManagement;
+    private final Parties parties = new Parties();
+    private PartyCommand partyCommand;
+    private Minigames minigames;
     private static final MinecraftChannelIdentifier CONSOLE_CHANNEL = MinecraftChannelIdentifier.from(ConsoleBridgeProtocol.CHANNEL);
 
     public VestriDynamicServers(ProxyServer proxy, Logger logger) {
@@ -83,6 +86,16 @@ public final class VestriDynamicServers {
             logger.error("Could not create plugin configuration; check plugin-folder permissions");
         }
         proxy.getChannelRegistrar().register(CONSOLE_CHANNEL);
+        partyCommand = new PartyCommand(proxy, parties);
+        proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("party").plugin(this).build(), partyCommand);
+        try {
+            minigames = new Minigames(proxy, parties, dataDirectory, logger);
+            proxy.getCommandManager().register(proxy.getCommandManager().metaBuilder("minigame").plugin(this).build(), minigames);
+            proxy.getScheduler().buildTask(this, minigames::sweep).delay(Duration.ofSeconds(1))
+                    .repeat(Duration.ofSeconds(1)).schedule();
+        } catch (IOException failure) {
+            logger.error("Minigame management disabled: {}", failure.getMessage());
+        }
         SpawnPlayerTransfer playerTransfer = new SpawnPlayerTransfer(proxy,
                 (task, delay) -> proxy.getScheduler().buildTask(this, task).delay(delay).schedule());
         try {
@@ -143,6 +156,9 @@ public final class VestriDynamicServers {
             if (playerServers != null) {
                 playerServers.beforeConnect(event);
             }
+            if (minigames != null) {
+                minigames.beforeConnect(event);
+            }
         });
     }
 
@@ -154,6 +170,9 @@ public final class VestriDynamicServers {
             }
             if (playerServers != null) {
                 playerServers.connected(event.getServer());
+            }
+            if (partyCommand != null && (minigames == null || !minigames.isMatchServer(event.getServer()))) {
+                partyCommand.connected(event.getPlayer(), event.getServer());
             }
         });
     }
@@ -184,6 +203,10 @@ public final class VestriDynamicServers {
             if (playerManagement != null) {
                 playerManagement.disconnected(event);
             }
+            parties.leave(event.getPlayer().getUniqueId());
+            if (minigames != null) {
+                minigames.disconnected(event.getPlayer().getUniqueId());
+            }
         });
     }
 
@@ -198,6 +221,9 @@ public final class VestriDynamicServers {
 
     @Subscribe
     public void shutdown(ProxyShutdownEvent event) {
+        if (minigames != null) {
+            minigames.close();
+        }
         if (playerManagement != null) {
             try {
                 playerManagement.shutdown();
@@ -250,7 +276,8 @@ public final class VestriDynamicServers {
         if (Files.size(manifest) > 1024 * 1024) {
             throw new IOException("Dynamic server manifest exceeds 1 MiB");
         }
-        JsonObject servers = JsonParser.parseString(Files.readString(manifest, StandardCharsets.UTF_8)).getAsJsonObject().getAsJsonObject("servers");
+        JsonObject configuration = JsonParser.parseString(Files.readString(manifest, StandardCharsets.UTF_8)).getAsJsonObject();
+        JsonObject servers = configuration.getAsJsonObject("servers");
         if (servers == null || servers.size() > 100) {
             throw new IOException("Invalid dynamic server manifest");
         }
@@ -270,6 +297,11 @@ public final class VestriDynamicServers {
                 throw new IOException("Dynamic name conflicts with an ordinary proxy server");
             }
             desired.put(name, new ServerInfo(name, InetSocketAddress.createUnresolved(host, port)));
+        }
+        if (minigames != null) {
+            minigames.synchronize(configuration);
+        } else if (configuration.has("minigames") && configuration.getAsJsonObject("minigames").size() > 0) {
+            throw new IOException("Minigame management is unavailable; refusing unguarded registration");
         }
         for (var registered : proxy.getAllServers()) {
             String name = registered.getServerInfo().getName();

@@ -6,4 +6,4 @@ description: Authenticated console-only lifecycle command forwarding to Velocity
 commands:
   vestridynamic:
     description: Forward Vestri lifecycle commands from the backend console to Velocity
-    usage: vestridynamic <templates|list|spawn|delete> [arguments]
+    usage: vestridynamic <templates|list|spawn|delete|ready|end> [arguments]

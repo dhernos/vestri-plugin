@@ -7,6 +7,7 @@ import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -234,6 +235,7 @@ final class PlayerServers implements SimpleCommand {
             if (!client.templates().contains(template)) {
                 throw new IOException("Unknown template. Available: " + String.join(", ", client.templates()));
             }
+            requirePlayerTemplate(template);
             var entry = reserveForSpawn(player, template, type, policy, client, UUID.randomUUID());
             message(player, "Preparing " + serverName(entry) + ". We'll connect you when it's ready.");
             spawn(player, entry, client);
@@ -288,8 +290,27 @@ final class PlayerServers implements SimpleCommand {
         }
     }
 
+    private void requirePlayerTemplate(String template) throws IOException {
+        Path manifest = configuration.resolveSibling("vestri-dynamic-servers.json");
+        if (!Files.exists(manifest)) {
+            return;
+        }
+        if (Files.size(manifest) > 1024 * 1024) {
+            throw new IOException("Dynamic server manifest exceeds 1 MiB");
+        }
+        try {
+            var games = com.google.gson.JsonParser.parseString(Files.readString(manifest)).getAsJsonObject().getAsJsonObject("minigames");
+            if (games != null && games.keySet().stream().anyMatch(name -> name.equalsIgnoreCase(template))) {
+                throw new IOException("Use /minigame join " + template + " for minigame templates.");
+            }
+        } catch (RuntimeException failure) {
+            throw new IOException("Invalid dynamic server manifest", failure);
+        }
+    }
+
     private void spawn(Player player, OwnedServerRegistry.Entry entry, MinecraftInstanceClient client)
             throws IOException, InterruptedException {
+        requirePlayerTemplate(entry.template);
         long timeout = Duration.ofSeconds(PlayerServerPolicy.load(configuration).preparationTimeoutSeconds()).toMillis();
         entry.preparationDeleteAfter = clock.getAsLong() + timeout;
         registry.save();
@@ -420,6 +441,11 @@ final class PlayerServers implements SimpleCommand {
         }
         var entry = registry.all().stream().filter(owned -> matches(owned, target)).findFirst().orElse(null);
         if (entry == null) {
+            return;
+        }
+        if (!entry.canJoin(event.getPlayer().getUniqueId(), adminJoin(event.getPlayer()))) {
+            event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            message(event.getPlayer(), "You are not invited to this server.");
             return;
         }
         if (entry.state != OwnedServerRegistry.State.ACTIVE) {
