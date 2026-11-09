@@ -2,7 +2,6 @@ package com.vestri.dynamic.bukkit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -84,18 +83,10 @@ class PreStartGuardTest {
     }
 
     static <Type> Type stub(Class<Type> type, Function<String, Object> values) {
-        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, (proxy, method, args) -> {
-            if (method.getName().equals("hashCode")) return System.identityHashCode(proxy);
-            if (method.getName().equals("equals")) return proxy == args[0];
-            if (method.getName().equals("toString")) return type.getSimpleName();
-            Object value = values.apply(method.getName());
-            if (value != null || !method.getReturnType().isPrimitive()) return value;
-            if (method.getReturnType() == boolean.class) return false;
-            if (method.getReturnType() == double.class) return 0d;
-            if (method.getReturnType() == float.class) return 0f;
-            if (method.getReturnType() == long.class) return 0L;
-            return 0;
-        }));
+        return org.mockito.Mockito.mock(type, invocation -> {
+            Object value = values.apply(invocation.getMethod().getName());
+            return value != null ? value : org.mockito.Answers.RETURNS_DEFAULTS.answer(invocation);
+        });
     }
 
     @Test
