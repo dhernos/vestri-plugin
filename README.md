@@ -853,7 +853,7 @@ minigame:
   teamPolicy: roles
   teams: [speedrunner, hunter]
   teamSize: 8
-  teamCounts: {speedrunner: 2}
+  teamCounts: { speedrunner: 2 }
   remainderTeam: hunter
   minPlayers: 2
   maxPlayers: 8
