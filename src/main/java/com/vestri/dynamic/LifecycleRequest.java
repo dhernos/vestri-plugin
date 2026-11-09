@@ -4,7 +4,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-record LifecycleRequest(String action, String template, UUID requestId, UUID instanceId, String sendPlayer, String serverType) {
+record LifecycleRequest(String action, String template, UUID requestId, UUID instanceId, String sendPlayer, String serverType, String variant) {
+    LifecycleRequest(String action, String template, UUID requestId, UUID instanceId, String sendPlayer, String serverType) {
+        this(action, template, requestId, instanceId, sendPlayer, serverType, "");
+    }
+
     static LifecycleRequest parse(String[] arguments) {
         if (arguments.length == 1 && arguments[0].equals("templates")) {
             return new LifecycleRequest("templates", "", null, null, null, null);
@@ -18,6 +22,7 @@ record LifecycleRequest(String action, String template, UUID requestId, UUID ins
         UUID instanceId = null;
         String sendPlayer = null;
         String serverType = null;
+        String variant = "";
         boolean confirmed = false;
         for (int index = 1; index < arguments.length; index++) {
             String argument = arguments[index];
@@ -37,6 +42,11 @@ record LifecycleRequest(String action, String template, UUID requestId, UUID ins
                 if (!List.of("permanent", "temporary").contains(serverType)) {
                     throw new IllegalArgumentException("Invalid server type");
                 }
+            } else if (argument.equals("--variant") && action.equals("spawn") && variant.isEmpty() && index + 1 < arguments.length) {
+                variant = arguments[++index];
+                if (!variant.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+                    throw new IllegalArgumentException("Invalid variant");
+                }
             } else if (argument.startsWith("--")) {
                 throw new IllegalArgumentException("Invalid option");
             } else {
@@ -50,13 +60,16 @@ record LifecycleRequest(String action, String template, UUID requestId, UUID ins
         if (template.isEmpty() || (action.equals("delete") && !confirmed)) {
             throw new IllegalArgumentException("Template and deletion confirmation are required");
         }
+        if (serverType != null && !variant.isEmpty()) {
+            throw new IllegalArgumentException("Variants are only supported for minigame spawning");
+        }
         if (serverType != null && sendPlayer == null) {
             throw new IllegalArgumentException("Owned server spawning requires --send-player");
         }
         if (action.equals("spawn") && requestId == null) {
             requestId = UUID.randomUUID();
         }
-        return new LifecycleRequest(action, template, requestId, instanceId, sendPlayer, serverType);
+        return new LifecycleRequest(action, template, requestId, instanceId, sendPlayer, serverType, variant);
     }
 
     private static UUID parseUUID(String value) {

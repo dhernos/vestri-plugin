@@ -274,6 +274,41 @@ class MinecraftLifecycleCommandTest {
     }
 
     private SpawnResult executeSpawn(Minigames minigames, boolean sendPlayer, String manifest) throws Exception {
+        return executeSpawn(minigames, sendPlayer, manifest, "");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void forwardsVariantForPlainAndSelectedSpawnsWithoutBypassingRoster(boolean sendPlayer) throws Exception {
+        Minigames minigames = mock(Minigames.class);
+        when(minigames.joinInstance(any(), any(), any())).thenReturn(true);
+        SpawnResult result = executeSpawn(minigames, sendPlayer, "{\"minigames\":{\"Bed Wars\":{}}}", "4v4v4v4");
+        assertEquals(List.of("POST"), result.calls());
+        if (sendPlayer) {
+            verify(minigames).joinInstance(eq(result.player()), eq(result.instance()), any());
+        } else {
+            verifyNoInteractions(minigames);
+        }
+        verify(result.transfer(), never()).start(any(), any(), any());
+    }
+
+    @Test
+    void rejectsOwnedVariantBeforeSchedulingOrLookingUpPlayer() {
+        List<Runnable> scheduled = new ArrayList<>();
+        SpawnPlayerTransfer transfer = mock(SpawnPlayerTransfer.class);
+        PlayerServers owned = mock(PlayerServers.class);
+        MinecraftLifecycleCommand command = new MinecraftLifecycleCommand(scheduled::add, directory.resolve("absent.json"), transfer, owned);
+        Invocation invocation = mock(Invocation.class);
+        when(invocation.source()).thenReturn(mock(ConsoleCommandSource.class));
+        for (String type : List.of("permanent", "temporary")) {
+            when(invocation.arguments()).thenReturn(new String[]{"spawn", "Bed Wars", "--variant", "solo", "--type", type, "--send-player", "Luis"});
+            command.execute(invocation);
+        }
+        assertEquals(List.of(), scheduled);
+        verifyNoInteractions(transfer, owned);
+    }
+
+    private SpawnResult executeSpawn(Minigames minigames, boolean sendPlayer, String manifest, String variant) throws Exception {
         UUID request = UUID.randomUUID();
         UUID playerId = UUID.randomUUID();
         var instance = new MinecraftInstanceClient.SpawnedInstance(UUID.randomUUID().toString(),
@@ -293,16 +328,22 @@ class MinecraftLifecycleCommandTest {
         ConsoleCommandSource console = mock(ConsoleCommandSource.class);
         Invocation invocation = mock(Invocation.class);
         when(invocation.source()).thenReturn(console);
-        when(invocation.arguments()).thenReturn(sendPlayer
-                ? new String[]{"spawn", "Bed Wars", "--send-player", "Luis", "--request-id", request.toString()}
-                : new String[]{"spawn", "Bed Wars", "--request-id", request.toString()});
+        List<String> arguments = new ArrayList<>(List.of("spawn", "Bed", "Wars", "--request-id", request.toString()));
+        if (sendPlayer) {
+            arguments.addAll(List.of("--send-player", "Luis"));
+        }
+        if (!variant.isEmpty()) {
+            arguments.addAll(List.of("--variant", variant));
+        }
+        when(invocation.arguments()).thenReturn(arguments.toArray(String[]::new));
         List<String> calls = new ArrayList<>();
+        List<String> bodies = new ArrayList<>();
         String key = "vmc_" + "a".repeat(64);
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/api/minecraft/v1/instances", exchange -> {
             calls.add(exchange.getRequestMethod());
             assertEquals("Bearer " + key, exchange.getRequestHeaders().getFirst("Authorization"));
-            assertTrue(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8).contains(request.toString()));
+            bodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             byte[] response = ("{\"serverId\":\"" + instance.serverId() + "\",\"slug\":\"" + instance.slug()
                     + "\",\"name\":\"" + instance.name() + "\"}").getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
@@ -325,6 +366,14 @@ class MinecraftLifecycleCommandTest {
             assertEquals(List.of(), calls);
             assertEquals(1, scheduled.size());
             scheduled.get(0).run();
+            if (!calls.isEmpty()) {
+                var expected = new com.google.gson.JsonObject();
+                expected.addProperty("requestId", request.toString());
+                if (!variant.isEmpty()) {
+                    expected.addProperty("variant", variant);
+                }
+                assertEquals(List.of(expected), bodies.stream().map(com.google.gson.JsonParser::parseString).toList());
+            }
             return new SpawnResult(calls, player, instance, transfer, console);
         } finally {
             server.stop(0);

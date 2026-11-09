@@ -20,6 +20,53 @@ class ConsoleBridgeProtocolTest {
     }
 
     @Test
+    void signsVariantAndPlayerWithStableRequestIdAndRejectsTampering() throws Exception {
+        String original = "vestridynamic spawn Bed Wars --variant 4v4v4v4 --send-player Luis";
+        String command = ConsoleBridgeProtocol.prepareCommand(original);
+        org.junit.jupiter.api.Assertions.assertTrue(command.startsWith(original + " --request-id "));
+        assertEquals(command, ConsoleBridgeProtocol.prepareCommand(command));
+        byte[] payload = ConsoleBridgeProtocol.encode(secret, command, now, UUID.randomUUID());
+        String verified = new ConsoleBridgeProtocol().verify(secret, payload, now);
+        var parsed = LifecycleRequest.parse(verified.substring("vestridynamic ".length()).split("\\s+"));
+        assertEquals("Bed Wars", parsed.template());
+        assertEquals("4v4v4v4", parsed.variant());
+        assertEquals("Luis", parsed.sendPlayer());
+        assertEquals(command, verified);
+        byte[] marker = "4v4v4v4".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int offset = java.util.Collections.indexOfSubList(
+                java.util.stream.IntStream.range(0, payload.length).mapToObj(index -> payload[index]).toList(),
+                java.util.stream.IntStream.range(0, marker.length).mapToObj(index -> marker[index]).toList());
+        payload[offset] = '2';
+        assertThrows(IOException.class, () -> new ConsoleBridgeProtocol().verify(secret, payload, now));
+    }
+
+    @Test
+    void acceptsSyntacticallyValidUnknownVariantForBackendValidation() throws Exception {
+        String command = "vestridynamic spawn Bed Wars --variant Unknown-Mode_2 --request-id " + UUID.randomUUID();
+        assertEquals(command, ConsoleBridgeProtocol.prepareCommand(command));
+        assertEquals(command, new ConsoleBridgeProtocol().verify(secret,
+                ConsoleBridgeProtocol.encode(secret, command, now, UUID.randomUUID()), now));
+    }
+
+    @Test
+    void rejectsVariantOutsideSpawnDuplicateFlagsAndUnsafeValues() {
+        for (String command : new String[]{
+                "vestridynamic list Bed Wars --variant solo",
+                "vestridynamic templates --variant solo",
+                "vestridynamic delete Bed Wars --confirm --variant solo",
+                "vestridynamic spawn Bed Wars --variant solo --variant duo",
+                "vestridynamic spawn Bed Wars --variant solo --send-player Luis --send-player Other",
+                "vestridynamic spawn Bed Wars --variant solo --request-id " + UUID.randomUUID() + " --request-id " + UUID.randomUUID(),
+                "vestridynamic spawn Bed Wars --variant solo --type temporary --send-player Luis",
+                "vestridynamic spawn Bed Wars --variant mode;stop",
+                "vestridynamic spawn Bed Wars --variant " + "a".repeat(65),
+                "vestridynamic spawn Bed Wars --variant solo --arbitrary value"}) {
+            assertThrows(IllegalArgumentException.class, () -> ConsoleBridgeProtocol.prepareCommand(command));
+            assertThrows(IllegalArgumentException.class, () -> ConsoleBridgeProtocol.encode(secret, command, now, UUID.randomUUID()));
+        }
+    }
+
+    @Test
     void authenticatesPlayerTargetAndPreservesItInRetryCommand() throws Exception {
         String command = ConsoleBridgeProtocol.prepareCommand("vestridynamic spawn Bed Wars --send-player Luis");
         assertEquals(command, ConsoleBridgeProtocol.prepareCommand(command));

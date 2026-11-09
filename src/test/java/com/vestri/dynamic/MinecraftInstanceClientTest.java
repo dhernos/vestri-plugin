@@ -156,6 +156,23 @@ class MinecraftInstanceClientTest {
     }
 
     @Test
+    void variantIsOptionalAndPreservedAcrossGatewayRetries() throws Exception {
+        client.spawnWithTarget("Bed Wars", UUID.randomUUID());
+        assertFalse(JsonParser.parseString(spawnBody).getAsJsonObject().has("variant"));
+        transientSpawnFailures = 1;
+        UUID request = UUID.randomUUID();
+        client.spawnWithTarget("Bed Wars", request, "4v4v4v4");
+        assertEquals(spawnRequests.get(1), spawnRequests.get(2));
+        var body = JsonParser.parseString(spawnBody).getAsJsonObject();
+        assertEquals("4v4v4v4", body.get("variant").getAsString());
+        assertEquals(request.toString(), body.get("requestId").getAsString());
+        assertEquals(Set.of("requestId", "variant"), body.keySet());
+        responseStatus = 409;
+        assertThrows(IOException.class, () -> client.spawnWithTarget("Bed Wars", request, "other"));
+        assertEquals(4, spawnRequests.size());
+    }
+
+    @Test
     void automaticallyRecoversGatewayFailureUsingExactlyTheSameRequest() throws Exception {
         transientSpawnFailures = 1;
         UUID requestId = UUID.randomUUID();

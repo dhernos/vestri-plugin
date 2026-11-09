@@ -23,14 +23,17 @@ public final class LifecycleSuggestions {
         if (previous.equals("--type") && action.equals("spawn")) {
             return List.of("permanent", "temporary").stream().filter(type -> startsWith(type, current)).toList();
         }
-        if (previous.equals("--instance") || previous.equals("--request-id") || previous.equals("--send-player")) {
+        if (previous.equals("--instance") || previous.equals("--request-id") || previous.equals("--send-player")
+            || previous.equals("--variant")) {
             return List.of();
         }
         if (current.startsWith("--")) {
-            List<String> options = action.equals("spawn") ? List.of("--request-id", "--send-player", "--type")
+            List<String> options = action.equals("spawn") ? List.of("--request-id", "--send-player", "--type", "--variant")
                     : action.equals("delete") ? List.of("--instance", "--confirm") : List.of();
             List<String> supplied = java.util.Arrays.asList(arguments).subList(0, arguments.length - 1);
-            return options.stream().filter(option -> startsWith(option, current) && !supplied.contains(option)).toList();
+                return options.stream().filter(option -> startsWith(option, current) && !supplied.contains(option))
+                    .filter(option -> !option.equals("--variant") || !supplied.contains("--type"))
+                    .filter(option -> !option.equals("--type") || !supplied.contains("--variant")).toList();
         }
         if (java.util.Arrays.stream(arguments).skip(1).anyMatch(argument -> argument.startsWith("--"))) {
             return List.of();

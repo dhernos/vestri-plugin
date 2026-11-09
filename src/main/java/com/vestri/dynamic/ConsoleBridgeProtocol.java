@@ -57,17 +57,20 @@ public final class ConsoleBridgeProtocol {
     }
 
     public static void validateCommand(String command) {
+        parseCommand(command);
+    }
+
+    private static LifecycleRequest parseCommand(String command) {
         if (command.length() > 512 || command.chars().anyMatch(value -> value < 32 || value == 127)
                 || !command.startsWith("vestridynamic ")) {
             throw new IllegalArgumentException("Only Vestri lifecycle commands can be forwarded");
         }
-        LifecycleRequest.parse(command.substring("vestridynamic ".length()).trim().split("\\s+"));
+        return LifecycleRequest.parse(command.substring("vestridynamic ".length()).trim().split("\\s+"));
     }
 
     public static String prepareCommand(String command) {
-        validateCommand(command);
+        LifecycleRequest request = parseCommand(command);
         String[] arguments = command.substring("vestridynamic ".length()).trim().split("\\s+");
-        LifecycleRequest request = LifecycleRequest.parse(arguments);
         if (request.action().equals("spawn") && !java.util.Arrays.asList(arguments).contains("--request-id")) {
             return command + " --request-id " + request.requestId();
         }

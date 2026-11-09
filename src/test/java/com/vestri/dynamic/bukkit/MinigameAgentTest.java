@@ -33,6 +33,246 @@ class MinigameAgentTest {
     private final UUID match = UUID.fromString("12345678-1234-1234-1234-123456789abc");
 
         @Test
+        void onlyVerifiedExactPluginLoggerCanEndAndRawAnchorsHaveNoPrefix() throws Exception {
+                String text = config("http://vestri-proxy-123:25580").replace("finished", "^xy$");
+                var config = MinigameAgent.configuration(text);
+                try (var agent = new MinigameAgent(null, config, data.resolve("logger.json"))) {
+                        trustGameLogger(agent);
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("starting", match,
+                                        List.of(new MinigameAgent.Member(match, "Player", "red"))), Set.of(match), command -> true);
+                        for (String source : List.of("", "Minecraft", "Vestri", "OtherGame", "game", "Game.child")) {
+                                agent.observeLog(log(source, "xy"));
+                                agent.apply(null, Set.of(match), command -> true);
+                                assertEquals("running", status(agent));
+                        }
+                        agent.observeLog("xy");
+                        agent.observeLog(log(null, "xy"));
+                        agent.observeLog(log("Game", "[Game] xy"));
+                        agent.apply(null, Set.of(match), command -> true);
+                        assertEquals("running", status(agent));
+                        agent.observeLog(log("Game", "xy"));
+                        agent.apply(null, Set.of(match), command -> true);
+                        assertEquals("ended", status(agent));
+                }
+        }
+
+        private static LogRecord log(String source, String text) {
+                var record = new LogRecord(java.util.logging.Level.INFO, text);
+                record.setLoggerName(source);
+                return record;
+        }
+
+        private static org.bukkit.plugin.Plugin gamePlugin(String loggerName) {
+                return (org.bukkit.plugin.Plugin) java.lang.reflect.Proxy.newProxyInstance(
+                                MinigameAgentTest.class.getClassLoader(), new Class<?>[]{org.bukkit.plugin.Plugin.class},
+                                (proxy, method, args) -> method.getName().equals("getLogger") ? Logger.getLogger(loggerName) : null);
+        }
+
+        private static void trustGameLogger(MinigameAgent agent) {
+                agent.configureLogSource(new org.bukkit.plugin.Plugin[]{gamePlugin("Game")},
+                                Logger.getLogger("Vestri"), Logger.getLogger("Minecraft"));
+        }
+
+        @Test
+        void allPhasesRunInOrderAndOnlyUnlockAfterTheLastCommand() throws Exception {
+                String text = phasedConfig();
+                var config = MinigameAgent.configuration(text);
+                var first = new MinigameAgent.Member(match, "First", "red");
+                var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
+                var third = new MinigameAgent.Member(UUID.randomUUID(), "Third", "red");
+                var roster = List.of(first, second, third);
+                var expected = List.of("start " + match, "red First red " + match, "red Third red " + third.uuid(),
+                                "again First", "again Third", "blue Second", "launch " + match, "final");
+                assertEquals(expected, MinigameAgent.expand(config, roster, match));
+                var starting = new MinigameAgent.Control("starting", match, roster);
+                Set<UUID> online = Set.of(first.uuid(), second.uuid(), third.uuid());
+                for (int failAt : List.of(-1, 0, 1, 6, 7)) {
+                        Path path = data.resolve("phases-" + failAt + ".json");
+                        try (var agent = new MinigameAgent(null, config, path)) {
+                                agent.ready();
+                                List<String> dispatched = new ArrayList<>();
+                                agent.apply(starting, online, command -> {
+                                        assertEquals("starting", status(agent));
+                                        dispatched.add(command);
+                                        return dispatched.size() - 1 != failAt;
+                                });
+                                assertEquals(failAt < 0 ? "running" : "failed", status(agent));
+                                assertEquals(expected.subList(0, failAt < 0 ? expected.size() : failAt + 1), dispatched);
+                                agent.apply(starting, online, command -> fail("No phase replay"));
+                        }
+                        try (var restored = new MinigameAgent(null, config, path)) {
+                                assertEquals("failed", status(restored));
+                                restored.ready();
+                                restored.apply(starting, online, command -> fail("No restart replay"));
+                        }
+                }
+        }
+
+        @Test
+        void newPhasesValidateTeamsScopesTypesAndNativeOwnership() {
+                String text = phasedConfig();
+                for (String invalid : List.of(
+                                text.replace("\"teams\":[\"red\",\"blue\"]", "\"teams\":[]"),
+                                text.replace("\"team\":\"red\"", "\"team\":\"unknown\""),
+                                text.replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"),
+                                text.replace("launch {matchId}", "launch {player}"),
+                                text.replace("launch {matchId}", "launch {team}"),
+                                text.replace("again {player}", "/op {player}"),
+                                text.replace("again {player}", "again {unknown}"),
+                                text.replace("again {player}", "again\\n{player}"),
+                                text.replace("\"final\"", "false"))) {
+                        assertThrows(RuntimeException.class, () -> MinigameAgent.configuration(invalid), invalid);
+                }
+                var legacy = MinigameAgent.configuration(config("http://vestri-proxy-123:25580"));
+                assertTrue(legacy.teamCommands().isEmpty());
+                assertTrue(legacy.startCommands().isEmpty());
+        }
+
+        @Test
+        void boundsNewPhaseListsAndTotalExpansionBeforeAnyDispatch() throws Exception {
+                for (String phase : List.of("teamCommands", "startCommands")) {
+                        var root = com.google.gson.JsonParser.parseString(phasedConfig()).getAsJsonObject();
+                        var entries = root.getAsJsonObject("spec").getAsJsonObject("lifecycle").getAsJsonArray(phase);
+                        var entry = entries.get(0).deepCopy();
+                        while (entries.size() < 100) entries.add(entry.deepCopy());
+                        assertNotNull(MinigameAgent.configuration(root.toString()));
+                        entries.add(entry);
+                        assertThrows(IllegalArgumentException.class, () -> MinigameAgent.configuration(root.toString()));
+                }
+                var parsed = MinigameAgent.configuration(phasedConfig());
+                var roster = new ArrayList<MinigameAgent.Member>();
+                for (int index = 0; index < 512; index++) {
+                        roster.add(new MinigameAgent.Member(UUID.randomUUID(), "Player" + index, "red"));
+                }
+                var config = new MinigameAgent.Configuration(parsed.endpoint(), parsed.token(), parsed.teams(), parsed.trigger(),
+                                java.util.Collections.nCopies(8, new MinigameAgent.Action("prepare {player}", "player")), null,
+                                "vestri", "temporary", null, List.of(new MinigameAgent.TeamCommand("red", "assign {player}")), List.of());
+                assertThrows(IllegalArgumentException.class, () -> MinigameAgent.expand(config, roster, match));
+                try (var agent = new MinigameAgent(null, config, data.resolve("expansion-limit.json"))) {
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("starting", match, roster),
+                                        Set.copyOf(roster.stream().map(MinigameAgent.Member::uuid).toList()), command -> fail("Expand before dispatch"));
+                        assertEquals("failed", status(agent));
+                        assertTrue(agent.frozen(roster.get(0).uuid()));
+                }
+                String ffa = config("http://vestri-proxy-123:25580").replace("[\"red\",\"blue\"]", "[]")
+                                .replace("\"end\":", "\"teamCommands\":[],\"startCommands\":[\"begin {matchId}\"],\"end\":");
+                assertEquals(List.of("start " + match, "begin " + match), MinigameAgent.expand(MinigameAgent.configuration(ffa),
+                                List.of(new MinigameAgent.Member(match, "Player", "")), match));
+        }
+
+        private String phasedConfig() {
+                return config("http://vestri-proxy-123:25580").replace("\"end\":", "\"teamCommands\":["
+                                + "{\"team\":\"red\",\"command\":\"red {player} {team} {uuid}\"},"
+                                + "{\"team\":\"red\",\"command\":\"again {player}\"},"
+                                + "{\"team\":\"blue\",\"command\":\"blue {player}\"}],"
+                                + "\"startCommands\":[\"launch {matchId}\",\"final\"],\"end\":");
+        }
+
+        @Test
+        void broadRegexNeverAcceptsRootChatOrOtherPluginRecords() throws Exception {
+                var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580").replace("finished", ".*"));
+                try (var agent = new MinigameAgent(null, config, data.resolve("chat.json"))) {
+                        trustGameLogger(agent);
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("starting", match,
+                                        List.of(new MinigameAgent.Member(match, "Player", "red"))), Set.of(match), command -> true);
+                        for (String source : List.of("", "Minecraft", "global", "Vestri", "OtherGame")) {
+                                agent.observeLog(log(source, "<Player> Game finished"));
+                                agent.apply(null, Set.of(match), command -> true);
+                                assertEquals("running", status(agent));
+                        }
+                        agent.observeLog(log("Game", "genuine plugin signal"));
+                        agent.apply(null, Set.of(match), command -> true);
+                        assertEquals("ended", status(agent));
+                }
+        }
+
+        @Test
+        void legacyMissingUninstalledAndReservedLoggersDisableOnlyAutomaticEnd() throws Exception {
+                for (String source : List.of("missing", "Uninstalled", "Vestri", "Minecraft", "global", "server", "Game")) {
+                        String text = config("http://vestri-proxy-123:25580");
+                        text = source.equals("missing") ? text.replace("\"loggerName\":\"Game\",", "")
+                                        : text.replace("\"loggerName\":\"Game\"", "\"loggerName\":\"" + source + "\"");
+                        var config = MinigameAgent.configuration(text);
+                        Logger logger = Logger.getLogger("vestri-disabled-log-" + UUID.randomUUID());
+                        logger.setUseParentHandlers(false);
+                        var logs = capture(logger);
+                        try (var agent = new MinigameAgent(null, config, data.resolve(source + ".json"),
+                                        new MinigameAgent.Diagnostics(logger, System::nanoTime))) {
+                                agent.configureLogSource(new org.bukkit.plugin.Plugin[]{gamePlugin("Vestri"), gamePlugin("Minecraft"),
+                                                gamePlugin("global"), gamePlugin("server")}, Logger.getLogger("Vestri"), Logger.getLogger("Minecraft"));
+                                assertEquals(1, logs.size());
+                                assertTrue(logs.get(0).getMessage().contains("automatic log end disabled"));
+                                agent.ready();
+                                agent.apply(new MinigameAgent.Control("starting", match,
+                                                List.of(new MinigameAgent.Member(match, "Player", "red"))), Set.of(match), command -> true);
+                                agent.observeLog(log(source, "Game finished"));
+                                agent.apply(null, Set.of(match), command -> true);
+                                assertEquals("running", status(agent));
+                                agent.end();
+                                assertEquals("ended", status(agent));
+                        }
+                }
+        }
+
+        @Test
+        void loggerNameIsBoundedAsciiAndMustBeAString() {
+                String text = config("http://vestri-proxy-123:25580");
+                for (String name : List.of("A", "a".repeat(128), "com.example.Game:logger-1_2")) {
+                        assertEquals(name, MinigameAgent.configuration(text.replace("\"Game\"", "\"" + name + "\"")).loggerName());
+                }
+                for (String invalid : List.of("\"\"", "null", "123", "true", "[]", "{}", "\" Game\"",
+                                "\"Game \"", "\"Game\\n\"", "\"G\\u0430me\"", "\"" + "a".repeat(129) + "\"")) {
+                        assertThrows(RuntimeException.class, () -> MinigameAgent.configuration(text.replace("\"Game\"", invalid)));
+                }
+        }
+
+        @Test
+        void managedGuardTracksRosterStartupFailureEndRestartAndCloseButNeverNative() throws Exception {
+                var config = MinigameAgent.configuration(phasedConfig());
+                var roster = List.of(new MinigameAgent.Member(match, "Player", "red"));
+                var starting = new MinigameAgent.Control("starting", match, roster);
+                for (String outcome : List.of("success", "false", "throw", "end")) {
+                        Path path = data.resolve("guard-" + outcome + ".json");
+                        var agent = new MinigameAgent(null, config, path);
+                        try (agent) {
+                                assertFalse(agent.frozen(match));
+                                agent.apply(starting, Set.of(match), command -> fail("Wait for readiness"));
+                                assertTrue(agent.frozen(match));
+                                assertFalse(agent.frozen(UUID.randomUUID()));
+                                agent.ready();
+                                agent.apply(starting, Set.of(), command -> fail("Wait for every player"));
+                                assertTrue(agent.frozen(match));
+                                agent.apply(starting, Set.of(match), command -> {
+                                        assertTrue(agent.frozen(match));
+                                        if (outcome.equals("throw")) throw new IllegalStateException();
+                                        if (outcome.equals("end")) agent.end();
+                                        return !outcome.equals("false");
+                                });
+                                assertEquals(!outcome.equals("success"), agent.frozen(match));
+                                agent.end();
+                                assertTrue(agent.frozen(match));
+                        }
+                        assertFalse(agent.frozen(match));
+                        try (var restored = new MinigameAgent(null, config, path)) {
+                                assertTrue(restored.frozen(match));
+                        }
+                }
+                var nativeConfig = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
+                try (var nativeAgent = new MinigameAgent(null, nativeConfig, data.resolve("unguarded-native.json"))) {
+                        nativeAgent.apply(new MinigameAgent.Control("starting", match, roster, 1), Set.of(), command -> fail("Native phase"));
+                        assertFalse(nativeAgent.frozen(match));
+                        nativeAgent.ready();
+                        assertFalse(nativeAgent.frozen(match));
+                        nativeAgent.end();
+                        assertFalse(nativeAgent.frozen(match));
+                }
+        }
+
+        @Test
         void unavailableControlIsPermanentOnly() {
                 String response = "{\"state\":\"unavailable\",\"matchId\":\"" + match
                                 + "\",\"rosterVersion\":2,\"roster\":[]}";
@@ -164,24 +404,25 @@ class MinigameAgentTest {
                 var starting = new MinigameAgent.Control("starting", match,
                                 List.of(new MinigameAgent.Member(match, "Player", "red")));
                 try (var agent = new MinigameAgent(null, config, data.resolve("minigame-execution.json"))) {
-                        agent.observeLog("previous Game finished");
+                        trustGameLogger(agent);
+                        agent.observeLog(log("Game", "previous Game finished"));
                         agent.apply(null, Set.of(), command -> true);
                         assertEquals("joining", status(agent));
                         agent.ready();
-                        agent.observeLog("Game finished");
+                        agent.observeLog(log("Game", "Game finished"));
                         agent.apply(starting, Set.of(), command -> true);
                         assertEquals("joining", status(agent));
-                        agent.observeLog("Game finished");
+                        agent.observeLog(log("Game", "Game finished"));
                         agent.apply(starting, Set.of(match), command -> {
-                                agent.observeLog("Game finished");
+                                agent.observeLog(log("Game", "Game finished"));
                                 return true;
                         });
                         agent.apply(null, Set.of(match), command -> true);
                         assertEquals("running", status(agent));
-                        agent.observeLog("unrelated");
+                        agent.observeLog(log("Game", "unrelated"));
                         agent.apply(null, Set.of(match), command -> true);
                         assertEquals("running", status(agent));
-                        agent.observeLog("Game finished");
+                        agent.observeLog(log("Game", "Game finished"));
                         agent.apply(null, Set.of(match), command -> true);
                         assertEquals("ended", status(agent));
                         assertFalse(agent.allows(match));
@@ -468,7 +709,8 @@ class MinigameAgentTest {
                         assertEquals("ready", status(agent));
                         agent.apply(new MinigameAgent.Control("joining", match, List.of(), 1), Set.of(), command -> fail("Native dispatch"));
                         assertEquals("running", status(agent));
-                        agent.observeLog("Game finished");
+                        trustGameLogger(agent);
+                        agent.observeLog(log("Game", "Game finished"));
                         agent.apply(null, Set.of(), command -> fail("Native dispatch"));
                         assertEquals("ended", status(agent));
                 }
@@ -1019,6 +1261,6 @@ class MinigameAgentTest {
         return "{\"slug\":\"mcgame-123\",\"token\":\"" + "a".repeat(64) + "\",\"controlUrl\":\"" + url
                 + "\",\"spec\":{\"teams\":[\"red\",\"blue\"],\"lifecycle\":{"
                 + "\"ready\":{\"trigger\":\"explicit\"},\"onAllJoined\":[{\"command\":\"start {matchId}\"}],"
-                + "\"end\":{\"logPattern\":\"finished\"}}}}";
+                + "\"end\":{\"loggerName\":\"Game\",\"logPattern\":\"finished\"}}}}";
     }
 }

@@ -16,7 +16,7 @@ import org.slf4j.LoggerFactory;
 
 final class MinecraftLifecycleCommand implements SimpleCommand {
     private static final String USAGE = "vestridynamic templates | list <template name> | "
-            + "spawn <template name> [--request-id UUID] [--send-player name] [--type permanent|temporary] | delete <template name> [--instance UUID] --confirm | sync";
+            + "spawn <template name> [--request-id UUID] [--send-player name] [--variant name | --type permanent|temporary] | delete <template name> [--instance UUID] --confirm | sync";
     private final Consumer<Runnable> schedule;
     private final Path configuration;
     private final SpawnPlayerTransfer transfer;
@@ -112,10 +112,10 @@ final class MinecraftLifecycleCommand implements SimpleCommand {
                             yield "Owned " + command.serverType() + " server request processed for " + selected.getUsername() + ".";
                         }
                         if (selected == null) {
-                            var instance = client.spawnWithTarget(command.template(), command.requestId());
+                            var instance = client.spawnWithTarget(command.template(), command.requestId(), command.variant());
                             yield "Server starting: " + (instance.name() == null ? command.template() : instance.name());
                         }
-                        var instance = client.spawnWithTarget(command.template(), command.requestId());
+                        var instance = client.spawnWithTarget(command.template(), command.requestId(), command.variant());
                         invocation.source().sendMessage(Component.text("Server starting: " + (instance.name() == null ? command.template() : instance.name()), NamedTextColor.AQUA));
                         Consumer<String> output = message -> invocation.source().sendMessage(Component.text(message, NamedTextColor.AQUA));
                         if (minigames == null || !minigames.joinInstance(selected, instance, output)) {

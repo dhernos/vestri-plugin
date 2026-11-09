@@ -755,6 +755,7 @@ Run these as players on the proxy:
 /party disband
 /party leader Friend
 /minigame join Arena
+/minigame join Bed Wars --variant 2v2
 /minigame leave
 /minigame list
 ```
@@ -826,6 +827,17 @@ equal to the dashboard template names for matchmaking. Use the existing
 configuration, and no player name is stored in it. Do not put template API keys
 in Paper configs.
 
+Dashboard edits use `PATCH /api/nodes/{nodeRef}/minecraft/resources/{resourceId}`
+with a full `minigame` replacement and optional `maxInstances`. Changed game
+settings apply to **new instances only**: existing instances and saved-request
+retries keep their pinned spawn-time settings. Incompatible ready instances are
+drained rather than reconfigured; active matches retain their original lifecycle.
+Setting `minigame.enabled: false` stops new queue admissions and replenishment
+and removes queued entries; it does not end active matches. Deleting a template
+that still has instances first disables its pool and, once published, returns
+HTTP **409**: delete the instances, then retry template deletion. See
+**Dashboard Deletion and Cleanup Recovery** below for committed HTTP 502 recovery.
+
 This YAML illustrates the saved-template settings represented by the dashboard;
 it is **not** a file to place in the plugin directory. The backend stores these
 settings as JSON. Retain the template's existing base, world, plugin, and proxy
@@ -835,44 +847,140 @@ references when applying them:
 mode: minigames
 maxInstances: 4
 minigame:
+  enabled: true
   lobbyMode: vestri
   instanceMode: temporary
-  teams: [red, blue]
-  teamSize: 2
+  teamPolicy: roles
+  teams: [speedrunner, hunter]
+  teamSize: 8
+  teamCounts: {speedrunner: 2}
+  remainderTeam: hunter
   minPlayers: 2
-  maxPlayers: 4
+  maxPlayers: 8
   joinTimeout: 20s
   readyServers: 1
   lifecycle:
     ready:
-      trigger: explicit
-    onAllJoined:
-      - command: "team add {team}"
-        forEach: team
-      - command: "team join {team} {player}"
-        forEach: player
-      - command: "say Match {matchId} ready"
+      trigger: serverLoad
+    onAllJoined: []
+    teamCommands:
+      - team: speedrunner
+        command: "YOUR_SPEEDRUNNER_COMMAND {player}"
+      - team: hunter
+        command: "YOUR_HUNTER_COMMAND {player}"
+    startCommands:
+      - "manhuntstart"
     end:
-      logPattern: "^MATCH_END$"
       whenEmpty: true
       emptyGrace: 10s
       returnPlayersTo: lobby
       deleteServer: true
 ```
 
-These are illustrative Minecraft console commands, without leading slashes.
-Use a template without preexisting `red`/`blue` scoreboard teams for this example;
-replace the final `say` with the installed gameplay plugin's actual start command
-when appropriate. The bridge does not implement that plugin's game rules.
+This is a minimal two-speedrunner Manhunt settings example, not a gameplay
+plugin configuration. Replace `YOUR_SPEEDRUNNER_COMMAND` and
+`YOUR_HUNTER_COMMAND` with that installed plugin's actual role-assignment console
+commands; `manhuntstart` is the example final start command and must also match
+the installed plugin. Commands have no leading slash. The bridge does not
+implement game rules; the gameplay plugin actually starts the game.
+
+`teamPolicy: roles` requires `lobbyMode: vestri`. Here exactly two individually
+selected players become `speedrunner` and everyone else becomes `hunter`.
+`teamSize` is each team's maximum capacity, not its required size; `maxPlayers`
+is the total cap. Keep `minPlayers >= 2` for two fixed speedrunners. At exactly
+two players there are no hunters; raise `minPlayers` if hunters must be present.
+Roles intentionally split parties to satisfy exact counts. Selection shuffles
+individual players, not whole parties; this is ordinary randomized assignment,
+not a security-grade randomness guarantee.
+
+Startup order is `lifecycle.onAllJoined` setup actions, then
+`lifecycle.teamCommands` entries (each `{team, command}` runs once for every
+player assigned to that exact team), then `lifecycle.startCommands` once-only
+final commands. Team commands support `{player}`, `{uuid}`, `{team}`, and
+`{matchId}`; final start commands accept only `{matchId}`. Together these arrays
+are limited to 100 configured commands.
 
 An action without `forEach` runs once and can use `{matchId}`. `forEach: team`
 runs once per configured team and can also use `{team}`. `forEach: player` runs
 once per roster player and can use `{player}`, `{uuid}`, and `{team}` as well as
 `{matchId}`. Here `{player}` is the roster's Minecraft name, not an NPC placeholder.
-For team-based matches, the proxy precomputes assignments while preserving whole parties on one
-team; the per-player action uses that assignment, rather than choosing teams
+For team-based matches, the proxy precomputes assignments; balanced policy keeps
+whole parties on one team, whereas roles may split them. The per-player action
+uses that assignment, rather than choosing teams
 again on Paper. `{player}` and `{uuid}` are invalid outside player scope, and
 `{team}` requires team or player scope.
+
+`teamPolicy: balanced` is the default. Twelve solos selected together for four
+teams of capacity four are distributed three per team. A party of four stays
+intact on one team rather than being split to even the counts. Assignment uses
+bounded packing to seek balanced sizes within capacity and randomizes ties; it
+does not guarantee a mathematically optimal packing for every party combination.
+
+### Named Bed Wars Variants
+
+For a template named **Bed Wars**, this base supports four teams of four and a
+smaller named variant. As above, retain the template's existing resource/proxy
+references; these settings are saved through the dashboard/API, not a YAML file:
+
+```yaml
+mode: minigames
+maxInstances: 4
+minigame:
+  enabled: true
+  lobbyMode: vestri
+  instanceMode: temporary
+  teamPolicy: balanced
+  teams: [red, blue, green, yellow]
+  teamSize: 4
+  minPlayers: 2
+  maxPlayers: 16
+  joinTimeout: 20s
+  readyServers: 1
+  variants:
+    2v2:
+      teams: [red, blue]
+      teamSize: 2
+      minPlayers: 2
+      maxPlayers: 4
+    4v4v4v4: {}
+  lifecycle:
+    ready:
+      trigger: serverLoad
+    onAllJoined:
+      - command: "team add {team}"
+        forEach: team
+      - command: "team join {team} {player}"
+        forEach: player
+    teamCommands: []
+    startCommands: []
+    end:
+      whenEmpty: true
+      emptyGrace: 10s
+      returnPlayersTo: lobby
+      deleteServer: true
+```
+
+The generic per-player `team join {team} {player}` uses each variant's resolved
+team list. Use a template without preexisting scoreboard teams for the `team add`
+example. These vanilla commands set up scoreboard teams only: configure the
+installed Bed Wars plugin's actual setup/start commands as needed. Do not add
+base `teamCommands` for `green`/`yellow` when `2v2` removes those teams: every
+resolved variant validates the shared lifecycle, so that configuration is rejected.
+`4v4v4v4: {}` inherits the base settings unchanged.
+
+```text
+/minigame join Bed Wars --variant 2v2
+vestridynamic spawn Bed Wars --variant 2v2 --send-player Player
+```
+
+The first command is player-side; the second is proxy console/NPC-side (or the
+signed Paper console bridge). Variant selection is carried by the signed bridge;
+existing commands/flags without `--variant` remain compatible and select the base.
+Named variants have separate queues and on-demand pools. `readyServers` warms
+only the unnamed base pool, not even an identical named variant. Base and all
+variants share the aggregate template `maxInstances` cap.
+
+### Managed and Native Startup
 
 Teams are optional. Omit `teams` or use `teams: []` for FFA and omit `teamSize`.
 Team-scoped actions and `{team}` placeholders require configured teams; player
@@ -884,6 +992,9 @@ join, and dispatches startup actions before marking the match running.
 Use `lobbyMode: plugin` when the installed gameplay plugin owns its native lobby,
 countdown, teams, and game state. This mode bypasses Vestri's `minPlayers`
 queue threshold and startup commands; `lifecycle.onAllJoined` **must be empty**.
+`lifecycle.teamCommands` and `lifecycle.startCommands` must also be empty or
+omitted: the backend rejects nonempty startup arrays in plugin mode rather than
+silently ignoring them. Native game start is controlled by the gameplay plugin.
 Player bounds and `maxPlayers` still apply. For example, a minimal team-free
 native lobby with an explicit end signal is:
 
@@ -959,12 +1070,26 @@ kicking or rejecting admitted players under its own restrictions. Roster
 authorization and a version acknowledgement are not promises of gameplay
 acceptance. The Vestri-managed lifecycle is unchanged.
 
-In Vestri-managed mode, startup actions run only after the entire assigned roster has joined. Actions
-and their repetitions are dispatched in configured order; a rejected command
+In Vestri-managed mode, matching can proceed as soon as the queued roster meets
+`minPlayers` and a compatible instance is ready; there is no fixed queue countdown
+to fill to `maxPlayers`. This threshold is not a game-start timer. Actual startup
+actions run only after the entire assigned roster has joined Paper, not on a
+status ping or merely because the threshold was reached. Paper dispatches them
+as console commands on its main thread, once per match under the durable startup
+fence. Setup, per-team commands, and final start commands run in that order.
+A rejected command
 fails startup and stops later commands. **Command ordering is not an asynchronous
 completion guarantee**: a command returning successfully can still have work in
 flight. Use a gameplay-plugin adapter or explicit signal when initialization must
 finish before the next phase, rather than assuming sequential commands await it.
+
+Managed roster players remain guarded until successful dispatch of the final
+startup command (or successful completion of an empty command list). Coordinate
+movement, PvP/damage, world interactions, inventory actions, and player commands
+are blocked during joining/startup. Looking around is allowed, as are trusted
+plugin teleports needed for map setup. A startup failure keeps players guarded
+until evacuation/cleanup, not released into gameplay. Native plugin-owned
+lobbies do not install this pre-start guard or run Vestri's command phases.
 
 In Vestri-managed mode, `joinTimeout` is the maximum roster-join wait after the server acknowledges its
 assignment. A no-show or joining/starting timeout cancels the match, returns
@@ -1000,11 +1125,25 @@ vestridynamic end
 These are local minigame-agent signals, not proxy lifecycle commands and not
 player commands. `ready` signals application readiness; `end` explicitly ends
 a temporary match and is ignored for permanent instances. The configured
-`logPattern` is a Java regular expression applied only
-to **JUL (`java.util.logging`) log messages** while running. It is not a general
-console-output, stdout, Log4j, or SLF4J scraper. If a gameplay plugin does not emit
-the matching message through JUL, integrate a manual/plugin adapter that issues
-the explicit `vestridynamic end` command. In temporary mode, `whenEmpty` optionally
+`lifecycle.end.logPattern` is a Java regular expression applied with `find()` to
+the raw **JUL (`java.util.logging`) `LogRecord.getMessage()`** while running.
+Anchors work: `^xy$` matches the message `xy`, without a timestamp, level, or
+formatted console prefix. An unanchored pattern can match a substring. This is
+not a console-output, stdout, Log4j, or SLF4J scraper.
+
+Set `lifecycle.end.loggerName` explicitly to the exact, case-sensitive
+`getLogger().getName()` of the installed gameplay plugin, and verify that value
+against that plugin's source or runtime logger. The agent verifies it against
+installed plugin loggers and excludes Vestri, root/global, and server loggers;
+ordinary chat/server records do not qualify. A missing logger in a legacy spec,
+or an unverified logger, disables automatic log-end matching and emits a warning;
+it does not enable broad matching. Explicit and empty-server end remain available.
+Logger identity cannot distinguish a genuine outcome from malicious player text
+that the gameplay plugin itself logs through its own trusted logger. For a
+stronger integration, use a gameplay-plugin adapter that issues the console-only
+`vestridynamic end` command from actual game state, not player-supplied text.
+Use that explicit adapter as well if the plugin does not emit its end message
+through JUL. In temporary mode, `whenEmpty` optionally
 ends an empty running match after `emptyGrace`. Temporary end handling returns
 players to the exact
 Velocity registry name in `returnPlayersTo`, then deletes the empty instance;
@@ -1067,7 +1206,7 @@ automatically transfer offline players or relax the admission handshake.
 Dashboard instance deletion uses the backend's instance deletion path. After
 files and the database record are deleted, the backend publishes a complete
 authoritative proxy snapshot and triggers synchronization with an independent
-30-second timeout. Template creation/deletion also synchronize after commit.
+30-second timeout. Template creation/update/deletion also synchronize after commit.
 An authoritative snapshot retires previously bound ledger entries whose server
 IDs are missing, evacuates remaining known occupants, and removes local tracking
 without another template-key deletion. A non-authoritative snapshot cannot
@@ -1080,6 +1219,9 @@ administrator can retry authoritative synchronization through
 `POST /api/nodes/{nodeRef}/minecraft/proxies/{proxyRef}/sync`. Retry that sync,
 not template creation or deletion. Proxy console `vestridynamic sync` only reads
 the local manifest; it does not regenerate it from the backend database.
+For a committed template PATCH whose worker template-manifest write failed,
+retry the PATCH to repair that file; for a proxy publication/reload failure,
+retry the sync endpoint. Do not treat either committed 502 as a rollback.
 
 Automatic cleanup uses the pinned original API origin and template key. For a
 dashboard-created **minigame**, known-ID lifecycle operations also allow a key

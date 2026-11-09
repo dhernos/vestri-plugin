@@ -81,6 +81,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     private BukkitTask mainTask;
     private BukkitTask readyTask;
     private Handler logHandler;
+    private volatile String trustedEndLogger;
+    private PreStartGuard preStartGuard;
 
     private MinigameAgent(JavaPlugin plugin, Configuration config) throws IOException {
         this(plugin, config, plugin.getDataFolder().toPath().resolve("minigame-execution.json"));
@@ -137,14 +139,18 @@ public final class MinigameAgent implements Listener, AutoCloseable {
 
     private void enable() {
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
+        if (config.lobbyMode().equals("vestri")) {
+            preStartGuard = new PreStartGuard(this::frozen);
+            plugin.getServer().getPluginManager().registerEvents(preStartGuard, plugin);
+        }
         mainTask = plugin.getServer().getScheduler().runTaskTimer(plugin, this::tick, 1, 20);
         if (config.endPattern() != null) {
+            configureLogSource(plugin.getServer().getPluginManager().getPlugins(),
+                    plugin.getLogger(), plugin.getServer().getLogger());
             logHandler = new Handler() {
                 @Override
                 public void publish(LogRecord record) {
-                    if (record != null) {
-                        observeLog(record.getMessage());
-                    }
+                    observeLog(record);
                 }
 
                 @Override
@@ -176,11 +182,44 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         return !closed && readySignalled && !terminal() && allowed.contains(player);
     }
 
-    void observeLog(String message) {
-        if (!config.permanent() && !closed && state.equals("running") && config.endPattern() != null && message != null
+    boolean frozen(UUID player) {
+        return !closed && config.lobbyMode().equals("vestri") && !state.equals("running") && allowed.contains(player);
+    }
+
+    void configureLogSource(org.bukkit.plugin.Plugin[] installed, Logger own, Logger server) {
+        trustedEndLogger = null;
+        String name = config.loggerName();
+        if (name != null && !name.equals(own.getName()) && !name.equals(server.getName())
+                && !Set.of("", "global", "minecraft", "bukkit", "server", "vestri", "vestridynamicservers")
+                        .contains(name.toLowerCase(java.util.Locale.ROOT))) {
+            for (var candidate : installed) {
+                if (candidate.getLogger() != own && candidate.getLogger() != server
+                        && name.equals(candidate.getLogger().getName())) {
+                    trustedEndLogger = name;
+                    break;
+                }
+            }
+        }
+        if (config.endPattern() != null && trustedEndLogger == null) {
+            diagnostics.logger.warning("Minigame automatic log end disabled: lifecycle.end.loggerName must exactly match an installed game plugin logger (not Vestri or the server). Explicit and empty-server end remain available.");
+        }
+    }
+
+    /**
+     * The verified plugin logger is a trust boundary, not proof of a game outcome.
+     * Player text logged through that plugin's own logger cannot be distinguished from its end signal.
+     */
+    public void observeLog(LogRecord record) {
+        String message = record == null ? null : record.getMessage();
+        if (trustedEndLogger != null && record != null && trustedEndLogger.equals(record.getLoggerName())
+                && !config.permanent() && !closed && state.equals("running") && config.endPattern() != null && message != null
                 && message.length() <= 4096 && config.endPattern().matcher(message).find()) {
             endRequested.set(true);
         }
+    }
+
+    void observeLog(String message) {
+        observeLog(new LogRecord(java.util.logging.Level.INFO, message));
     }
 
     static final class DenyEntry implements Listener {
@@ -263,7 +302,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                     || !online.containsAll(allowed) || !fence.claimStartup(response.matchId())) {
                 return;
             }
-            List<String> commands = expand(config.actions(), config.teams(), roster, response.matchId());
+            state = "starting";
+            List<String> commands = expand(config, roster, response.matchId());
             boolean success = dispatch(commands, command -> !terminal() && execute.test(command));
             if (!terminal()) {
                 state = success ? "running" : "failed";
@@ -394,6 +434,9 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             readyTask.cancel();
         }
         HandlerList.unregisterAll(this);
+        if (preStartGuard != null) {
+            HandlerList.unregisterAll(preStartGuard);
+        }
         if (logHandler != null) {
             Logger.getLogger("").removeHandler(logHandler);
             logHandler.close();
@@ -441,29 +484,34 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 JsonObject entry = value.getAsJsonObject();
                 String command = string(entry.get("command"));
                 String forEach = entry.has("forEach") ? string(entry.get("forEach")) : "";
-                if (command.isBlank() || command.getBytes(StandardCharsets.UTF_8).length > 1024
-                        || command.strip().startsWith("/") || command.chars().anyMatch(Character::isISOControl)
-                        || !Set.of("", "team", "player").contains(forEach)
-                        || (teams.isEmpty() && forEach.equals("team"))) {
-                    throw new IllegalArgumentException();
-                }
-                var placeholders = Pattern.compile("\\{([^{}]*)\\}").matcher(command);
-                while (placeholders.find()) {
-                    String placeholder = placeholders.group(1);
-                    if (!Set.of("matchId", "team", "player", "uuid").contains(placeholder)
-                            || (placeholder.equals("team") && (forEach.isEmpty() || teams.isEmpty()))
-                            || (Set.of("player", "uuid").contains(placeholder) && !forEach.equals("player"))) {
-                        throw new IllegalArgumentException();
-                    }
-                }
-                String remaining = placeholders.replaceAll("");
-                if (remaining.contains("{") || remaining.contains("}")) {
-                    throw new IllegalArgumentException();
-                }
+                validateCommand(command, forEach, teams);
                 actions.add(new Action(command, forEach));
             });
         }
-        if (actions.size() > 100) {
+        List<TeamCommand> teamCommands = new ArrayList<>();
+        JsonArray teamEntries = lifecycle.getAsJsonArray("teamCommands");
+        if (teamEntries != null) {
+            teamEntries.forEach(value -> {
+                JsonObject entry = value.getAsJsonObject();
+                String team = string(entry.get("team"));
+                String command = string(entry.get("command"));
+                if (!teams.contains(team)) {
+                    throw new IllegalArgumentException("Unknown command team");
+                }
+                validateCommand(command, "player", teams);
+                teamCommands.add(new TeamCommand(team, command));
+            });
+        }
+        List<String> startCommands = new ArrayList<>();
+        JsonArray starts = lifecycle.getAsJsonArray("startCommands");
+        if (starts != null) {
+            starts.forEach(value -> {
+                String command = string(value);
+                validateCommand(command, "", teams);
+                startCommands.add(command);
+            });
+        }
+        if (actions.size() > 100 || teamCommands.size() > 100 || startCommands.size() > 100) {
             throw new IllegalArgumentException();
         }
         JsonObject end = lifecycle.getAsJsonObject("end");
@@ -472,11 +520,38 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             throw new IllegalArgumentException("Invalid permanent native lifecycle");
         }
         String pattern = end != null && end.has("logPattern") ? end.get("logPattern").getAsString() : "";
+        String loggerName = end != null && end.has("loggerName") ? string(end.get("loggerName")) : null;
+        if (loggerName != null && !loggerName.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) {
+            throw new IllegalArgumentException("Invalid end logger name");
+        }
         if (pattern.getBytes(StandardCharsets.UTF_8).length > 512 || pattern.contains("\n") || pattern.contains("\r")) {
             throw new IllegalArgumentException();
         }
         return new Configuration(URI.create(url.replaceAll("/$", "") + "/minigame/" + slug), token,
-            List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern), lobbyMode, instanceMode);
+            List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern),
+            lobbyMode, instanceMode, loggerName, List.copyOf(teamCommands), List.copyOf(startCommands));
+    }
+
+    private static void validateCommand(String command, String scope, List<String> teams) {
+        if (command.isBlank() || command.getBytes(StandardCharsets.UTF_8).length > 1024
+                || command.strip().startsWith("/") || command.chars().anyMatch(Character::isISOControl)
+                || !Set.of("", "team", "player").contains(scope)
+                || (teams.isEmpty() && scope.equals("team"))) {
+            throw new IllegalArgumentException();
+        }
+        var placeholders = Pattern.compile("\\{([^{}]*)\\}").matcher(command);
+        while (placeholders.find()) {
+            String placeholder = placeholders.group(1);
+            if (!Set.of("matchId", "team", "player", "uuid").contains(placeholder)
+                    || (placeholder.equals("team") && (scope.isEmpty() || teams.isEmpty()))
+                    || (Set.of("player", "uuid").contains(placeholder) && !scope.equals("player"))) {
+                throw new IllegalArgumentException();
+            }
+        }
+        String remaining = placeholders.replaceAll("");
+        if (remaining.contains("{") || remaining.contains("}")) {
+            throw new IllegalArgumentException();
+        }
     }
 
     private static boolean explicitFalse(JsonObject object, String key) {
@@ -598,7 +673,29 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 .replace("{matchId}", matchId.toString());
     }
 
+    static List<String> expand(Configuration config, List<Member> roster, UUID matchId) {
+        List<String> commands = new ArrayList<>(expand(config.actions(), config.teams(), roster, matchId));
+        for (TeamCommand action : config.teamCommands()) {
+            for (Member member : roster) {
+                if (action.team().equals(member.team())) {
+                    commands.add(expand(action.command(), member.name(), member.uuid().toString(), member.team(), matchId));
+                }
+                if (commands.size() > 4096) {
+                    throw new IllegalArgumentException("Too many lifecycle commands");
+                }
+            }
+        }
+        for (String command : config.startCommands()) {
+            commands.add(expand(command, "", "", "", matchId));
+        }
+        if (commands.size() > 4096) {
+            throw new IllegalArgumentException("Too many lifecycle commands");
+        }
+        return List.copyOf(commands);
+    }
+
     record Action(String command, String forEach) { }
+    record TeamCommand(String team, String command) { }
     record Member(UUID uuid, String name, String team) { }
     record Control(String state, UUID matchId, List<Member> roster, int rosterVersion) {
         Control(String state, UUID matchId, List<Member> roster) {
@@ -607,9 +704,12 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
     record Report(String state, UUID matchId, List<String> players, int rosterVersion) { }
     record Configuration(URI endpoint, String token, List<String> teams, String trigger,
-            List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode) {
+            List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode, String loggerName,
+            List<TeamCommand> teamCommands, List<String> startCommands) {
         Configuration {
             if (!Set.of("temporary", "permanent").contains(instanceMode)
+                || (lobbyMode.equals("plugin") && (!teamCommands.isEmpty() || !startCommands.isEmpty()))
+                || (loggerName != null && !loggerName.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))
                     || (instanceMode.equals("permanent") && (!lobbyMode.equals("plugin")
                             || !actions.isEmpty() || endPattern != null))) {
                 throw new IllegalArgumentException("Invalid instance mode");
@@ -618,6 +718,11 @@ public final class MinigameAgent implements Listener, AutoCloseable {
 
         boolean permanent() {
             return instanceMode.equals("permanent");
+        }
+
+        Configuration(URI endpoint, String token, List<String> teams, String trigger,
+                List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode) {
+            this(endpoint, token, teams, trigger, actions, endPattern, lobbyMode, instanceMode, null, List.of(), List.of());
         }
 
         Configuration(URI endpoint, String token, List<String> teams, String trigger,

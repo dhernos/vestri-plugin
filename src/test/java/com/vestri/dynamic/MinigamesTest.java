@@ -55,16 +55,213 @@ class MinigamesTest {
     private static final String ADMISSION_SLUG = "mcgame-" + "1".repeat(32);
     private static final String SECOND_ADMISSION_SLUG = "mcgame-" + "2".repeat(32);
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void disabledLifecycleEntryPointsDoNotSpawnOrRecover(boolean permanent) throws Exception {
+        JsonObject manifest = permanent ? permanentManifest() : manifest(null);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.addProperty("enabled", false);
+        Minigames.Instance instance = ready(manifest);
+        List<String> calls = new ArrayList<>();
+        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        api.createContext("/api/minecraft/v1/instances", exchange -> {
+            calls.add(exchange.getRequestMethod());
+            exchange.sendResponseHeaders(509, -1);
+            exchange.close();
+        });
+        api.start();
+        try {
+            Files.writeString(directory.resolve("vestri-dynamic-config.json"), "{\"backendUrl\":\"http://127.0.0.1:"
+                    + api.getAddress().getPort() + "\",\"templates\":{\"Arena\":\"vmc_" + TOKEN + "\"}}");
+            instance.lifecycleConfig = MinecraftInstanceClient.snapshot(directory.resolve("vestri-dynamic-config.json"), "Arena");
+            if (permanent) {
+                instance.state = "unavailable";
+                instance.heartbeat = 0;
+                var recover = Minigames.class.getDeclaredMethod("recoverStartup", Minigames.Instance.class);
+                recover.setAccessible(true);
+                recover.invoke(service, instance);
+                service.report(instance, report("ready", null));
+                assertEquals("unavailable", instance.state);
+            } else {
+                instance.state = "provisioning";
+                instance.serverId = null;
+                instance.slug = null;
+                instance.heartbeat = 0;
+                var provision = Minigames.class.getDeclaredMethod("provision", Minigames.Instance.class);
+                provision.setAccessible(true);
+                provision.invoke(service, instance);
+                assertNull(instance.serverId);
+            }
+            sweepWithoutNetwork(2);
+            assertTrue(calls.isEmpty());
+            assertEquals(1, instances().size());
+        } finally {
+            api.stop(0);
+        }
+    }
+
+    @Test
+    void multiwordVariantCommandsAndManagedManualJoinsUseTheExactVariantQueue() throws Exception {
+        JsonObject manifest = manifest(null);
+        JsonObject spec = manifest.getAsJsonObject("minigames").remove("Arena").getAsJsonObject();
+        spec.add("variants", JsonParser.parseString("{\"duel\":{\"maxPlayers\":2}}"));
+        manifest.getAsJsonObject("minigames").add("Bed Wars", spec);
+        JsonObject binding = manifest.getAsJsonObject("servers").getAsJsonObject("arena");
+        binding.addProperty("template", "Bed Wars");
+        binding.addProperty("variant", "duel");
+        binding.add("spec", MinigameSpec.variant(spec, "duel"));
+        Minigames.Instance instance = admissionReady(manifest);
+        configure("Bed Wars");
+        Player first = player("First");
+        service.execute(invocation(first, "join", "Bed", "Wars", "--variant", "duel"));
+        Player second = player("Second");
+        List<String> output = new ArrayList<>();
+        assertTrue(service.joinInstance(second, spawned(instance), output::add));
+        assertTrue(output.get(0).contains("--variant duel"));
+        Player rejected = player("Rejected");
+        for (String[] arguments : List.of(new String[]{"join", "Bed", "Wars", "--variant"},
+                new String[]{"join", "Bed", "Wars", "--variant", "missing"},
+                new String[]{"join", "Bed", "Wars", "--maxPlayers", "100"},
+                new String[]{"join", "Bed", "Wars", "--variant", "duel", "--variant", "duel"})) {
+            service.execute(invocation(rejected, arguments));
+        }
+        assertEquals(List.of("duel"), service.suggest(invocation(first, "join", "Bed", "Wars", "--variant", "")));
+        sweepWithoutNetwork(1);
+        assertEquals(2, instance.roster.size());
+        assertEquals(Set.of(first.getUniqueId().toString(), second.getUniqueId().toString()),
+                instance.roster.stream().map(Minigames.Member::uuid).collect(java.util.stream.Collectors.toSet()));
+        assertEquals("duel", service.report(instance, report("joining", instance.matchId)).get("variant").getAsString());
+    }
+
+    @Test
+    void disablingRemovesQueuesAndPendingJoinsButPreservesAdmittedRosterAndCleanup() throws Exception {
+        JsonObject manifest = lobbyManifest(true, true);
+        Minigames.Instance instance = admissionReady(manifest);
+        Player admitted = player("Admitted");
+        queue(admitted);
+        service.sweep();
+        Player waiting = player("Waiting");
+        queue(waiting);
+        Player exact = player("Exact");
+        List<String> messages = new ArrayList<>();
+        assertTrue(service.joinInstance(exact, spawned(instance), messages::add));
+        assertTrue(messages.get(0).contains("Waiting"));
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.addProperty("readyServers", 2);
+        spec.addProperty("enabled", false);
+        service.synchronize(manifest);
+        assertTrue(queue().isEmpty());
+        assertTrue(messages.get(messages.size() - 1).contains("disabled"));
+        assertEquals("joining", instance.state);
+        assertEquals(1, instance.roster.size());
+        queue(player("Blocked"));
+        assertTrue(queue().isEmpty());
+        assertTrue(service.joinInstance(exact, spawned(instance), messages::add));
+        assertTrue(messages.get(messages.size() - 1).contains("disabled"));
+        service.report(instance, versionedReport(instance, "running", instance.rosterVersion));
+        occupants.add(admitted);
+        service.report(instance, versionedReport(instance, "running", instance.rosterVersion, admitted));
+        assertEquals("running", instance.state);
+        service.report(instance, versionedReport(instance, "ended", instance.rosterVersion, admitted));
+        assertEquals("ending", instance.state);
+        occupants.clear();
+        manifest.getAsJsonObject("servers").remove(ADMISSION_SLUG);
+        manifest.addProperty("authoritative", true);
+        service.synchronize(manifest);
+        cleanup(instance);
+        sweepWithoutNetwork(3);
+        assertTrue(instances().isEmpty(), "Deleting a disabled pooled template must not replenish it");
+    }
+
+    @Test
+    void variantsHaveIsolatedQueuesResolvedBindingsAndSharedQuotaWithoutWarmVariantPools() throws Exception {
+        JsonObject manifest = manifest(null);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.add("variants", JsonParser.parseString("{\"4v4v4v4\":{\"teams\":[\"a\",\"b\",\"c\",\"d\"],\"teamSize\":4,\"maxPlayers\":16}}"));
+        JsonObject binding = manifest.getAsJsonObject("servers").getAsJsonObject("arena");
+        binding.addProperty("variant", "4v4v4v4");
+        binding.remove("spec");
+        Minigames.Instance instance = ready(manifest);
+        assertEquals("4v4v4v4", instance.variant);
+        assertEquals(16, MinigameSpec.parse(instance.specification).maxPlayers());
+        assertFalse(instance.specification.has("variants"));
+        Player base = player("Base");
+        Player baseSecond = player("BaseSecond");
+        queue(base);
+        queue(baseSecond);
+        Player variantFirst = player("VariantFirst");
+        Player variantSecond = player("VariantSecond");
+        service.execute(invocation(variantFirst, "join", "Arena", "--variant", "4v4v4v4"));
+        service.execute(invocation(variantSecond, "join", "Arena", "--variant", "4v4v4v4"));
+        assertEquals(List.of("4v4v4v4"), service.suggest(invocation(base, "join", "Arena", "--variant", "")));
+        sweepWithoutNetwork(1);
+        assertEquals("joining", instance.state);
+        assertEquals(Set.of(variantFirst.getUniqueId().toString(), variantSecond.getUniqueId().toString()),
+                instance.roster.stream().map(Minigames.Member::uuid).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(2, queue().size());
+        assertEquals(2, instances().size());
+        assertEquals("", instances().get(1).variant);
+        assertEquals("4v4v4v4", persisted().get(0).variant);
+        sweepWithoutNetwork(3);
+        assertEquals(2, instances().size(), "Variants share the base template instance cap");
+    }
+
+    @Test
+    void variantDefinitionsAndEnabledPoolControlsDoNotDrainAnUnchangedBase() throws Exception {
+        JsonObject manifest = manifest(null);
+        Minigames.Instance instance = ready(manifest);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.addProperty("enabled", false);
+        spec.addProperty("readyServers", 1);
+        spec.addProperty("maxInstances", 3);
+        spec.add("variants", JsonParser.parseString("{\"duel\":{\"maxPlayers\":2}}"));
+        service.synchronize(manifest);
+        assertEquals("ready", instance.state);
+        sweepWithoutNetwork(2);
+        assertEquals(1, instances().size());
+        spec.addProperty("enabled", true);
+        service.synchronize(manifest);
+        sweepWithoutNetwork(2);
+        assertEquals(1, instances().size(), "Only the base gets a warm pool");
+    }
+
+    @Test
+    void managedRolePartiesCanSplitAndPartialFixedRosterDefers() throws Exception {
+        JsonObject manifest = lobbyManifest(false, false);
+        JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
+        spec.addProperty("teamPolicy", "roles");
+        spec.addProperty("teamSize", 4);
+        spec.addProperty("minPlayers", 3);
+        spec.add("teamCounts", JsonParser.parseString("{\"red\":2}"));
+        spec.addProperty("remainderTeam", "blue");
+        manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
+        Minigames.Instance instance = ready(manifest);
+        Player[] players = party(3);
+        queue(players[0]);
+        service.sweep();
+        assertEquals("joining", instance.state);
+        assertEquals(3, instance.roster.size());
+        assertEquals(2, instance.roster.stream().filter(member -> member.team().equals("red")).count());
+        assertEquals(1, instance.roster.stream().filter(member -> member.team().equals("blue")).count());
+        assertEquals(1, instance.groups.size());
+    }
+
     @Test
     void pinnedLifecyclePersistsBeforeSpawnAndKeepsOriginalKeyAndOriginAfterRestart() throws Exception {
         service = new Minigames(proxy, parties, directory, logger, clock::get);
         Minigames.Instance instance = pending();
+        instance.variant = "duel";
         List<String> calls = new ArrayList<>();
         List<String> authorizations = new ArrayList<>();
         HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         api.createContext("/api/minecraft/v1/instances", exchange -> {
             calls.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
             authorizations.add(exchange.getRequestHeaders().getFirst("Authorization"));
+            if (exchange.getRequestMethod().equals("POST")) {
+                JsonObject request = JsonParser.parseString(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)).getAsJsonObject();
+                assertEquals("duel", request.get("variant").getAsString());
+                assertEquals(instance.requestId, request.get("requestId").getAsString());
+            }
             try {
                 assertEquals(instance.lifecycleConfig, persisted().get(0).lifecycleConfig);
             } catch (Exception failure) {
@@ -101,6 +298,7 @@ class MinigamesTest {
             provision.invoke(service, instance);
             service.close();
             service = new Minigames(proxy, parties, directory, logger, clock::get);
+            assertEquals("duel", instances().get(0).variant);
             cleanup(instances().get(0));
             assertTrue(instances().isEmpty());
             assertEquals(List.of("POST /api/minecraft/v1/instances", "DELETE /api/minecraft/v1/instances/" + SERVER_ID), calls);
@@ -1385,7 +1583,7 @@ class MinigamesTest {
             paper.exchange(online);
             assertTrue(instance.rosterJoined);
             assertEquals(0, instance.deadline);
-            paper.observeLog("Game finished");
+            paper.agent.end();
             paper.apply(null, online);
             assertEquals("ended", paper.report(online).get("state").getAsString());
             Object ending = paper.exchange(online);
@@ -1400,10 +1598,15 @@ class MinigamesTest {
 
     @Test
     void managedHttpProtocolAcceptsPaperVersionZeroAndRunsStartupOnce() throws Exception {
-        JsonObject manifest = lobbyManifest(false, true);
+        JsonObject manifest = lobbyManifest(false, false);
         JsonObject spec = manifest.getAsJsonObject("minigames").getAsJsonObject("Arena");
         spec.getAsJsonObject("lifecycle").add("onAllJoined", JsonParser.parseString(
                 "[{\"command\":\"start {matchId}\"}]"));
+        spec.getAsJsonObject("lifecycle").add("teamCommands", JsonParser.parseString(
+                "[{\"team\":\"red\",\"command\":\"assign {player} {team}\"},"
+                + "{\"team\":\"blue\",\"command\":\"assign {player} {team}\"}]"));
+        spec.getAsJsonObject("lifecycle").add("startCommands", JsonParser.parseString(
+                "[\"launch {matchId}\",\"final\"]"));
         manifest.getAsJsonObject("servers").getAsJsonObject("arena").add("spec", spec.deepCopy());
         Minigames.Instance instance = ready(manifest);
         Path execution = directory.resolve("managed-paper-execution.json");
@@ -1437,7 +1640,18 @@ class MinigamesTest {
                 return true;
             });
             assertEquals("starting", paper.value(starting, "state"));
-            assertEquals(List.of("start " + instance.matchId), commands);
+            List<String> expected = new ArrayList<>();
+            expected.add("start " + instance.matchId);
+            for (String team : List.of("red", "blue")) {
+                instance.roster.stream().filter(member -> member.team().equals(team))
+                        .forEach(member -> expected.add("assign " + member.name() + " " + team));
+            }
+            assertTrue(expected.size() > 1, "The managed roster must exercise the team command phase");
+            expected.add("launch " + instance.matchId);
+            expected.add("final");
+            assertEquals(expected, commands);
+            assertEquals(spec, instance.specification);
+            assertEquals(spec, persisted().get(0).specification);
             assertEquals("running", paper.report(online).get("state").getAsString());
             assertEquals(0, paper.report(online).get("rosterVersion").getAsInt());
             JsonObject saved = JsonParser.parseString(Files.readString(execution)).getAsJsonObject();
@@ -1448,7 +1662,7 @@ class MinigamesTest {
             assertEquals("running", paper.value(running, "state"));
             assertEquals("running", instance.state);
             assertEquals(ids, transfers);
-            assertEquals(1, commands.size());
+            assertEquals(expected, commands);
         }
     }
 
@@ -1523,10 +1737,6 @@ class MinigamesTest {
 
         boolean allows(UUID player) throws Exception {
             return (boolean) invoke("allows", new Class<?>[]{UUID.class}, agent, player);
-        }
-
-        void observeLog(String message) throws Exception {
-            invoke("observeLog", new Class<?>[]{String.class}, agent, message);
         }
 
         Object value(Object response, String name) throws Exception {
@@ -1720,7 +1930,7 @@ class MinigamesTest {
         queue(first);
         queue(second);
         service.sweep();
-        assertEquals(List.of("red", "blue"), instance.roster.stream().map(Minigames.Member::team).toList());
+        assertEquals(Set.of("red", "blue"), instance.roster.stream().map(Minigames.Member::team).collect(java.util.stream.Collectors.toSet()));
         occupants.addAll(List.of(first, second));
         service.report(instance, versionedReport(instance, "running", 1, first, second));
         Player[] blocked = party(2);
@@ -1729,7 +1939,7 @@ class MinigamesTest {
         queue(solo);
         service.sweep();
         assertEquals(3, instance.roster.size());
-        assertEquals("red", instance.roster.get(2).team());
+        assertTrue(Set.of("red", "blue").contains(instance.roster.get(2).team()));
         assertEquals(solo.getUniqueId().toString(), instance.roster.get(2).uuid());
         assertEquals(1, queue().size());
         assertEquals(parties.members(blocked[0].getUniqueId()), queue().get(0).players());

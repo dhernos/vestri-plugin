@@ -40,9 +40,11 @@ import org.slf4j.Logger;
 final class Minigames implements SimpleCommand, AutoCloseable {
     private static final Gson JSON = new GsonBuilder().create();
     record Member(String uuid, String name, String team) {}
-    record Binding(String name, String serverId, String template, String token, String spawnRequestId, JsonObject specification) {}
+    record Binding(String name, String serverId, String template, String token, String spawnRequestId, JsonObject specification,
+                   String variant) {}
     static final class Instance {
         String template;
+        String variant = "";
         String requestId;
         String slug;
         String serverId;
@@ -118,6 +120,12 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 }
                 for (Instance instance : saved) {
                     UUID.fromString(instance.requestId);
+                    if (instance.variant == null) {
+                        instance.variant = "";
+                    }
+                    if (!instance.variant.isEmpty() && !instance.variant.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+                        throw new IllegalArgumentException();
+                    }
                     if (instance.template == null || instance.template.isBlank() || instance.created < 0) {
                         throw new IllegalArgumentException();
                     }
@@ -193,9 +201,15 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 if (requestId != null) {
                     UUID.fromString(requestId);
                 }
-                JsonObject specification = target.has("spec") ? target.getAsJsonObject("spec").deepCopy() : nextSpecifications.get(template).deepCopy();
+                String variant = target.has("variant") ? target.get("variant").getAsString() : "";
+                if (!variant.isEmpty() && !variant.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+                    throw new IllegalArgumentException();
+                }
+                JsonObject specification = target.has("spec") ? MinigameSpec.variant(target.getAsJsonObject("spec"),
+                    target.getAsJsonObject("spec").has("variants") ? variant : "")
+                        : MinigameSpec.variant(nextSpecifications.get(template), variant);
                 MinigameSpec.parse(specification);
-                nextBindings.put(entry.getKey(), new Binding(target.get("name").getAsString(), id, template, token, requestId, specification));
+                nextBindings.put(entry.getKey(), new Binding(target.get("name").getAsString(), id, template, token, requestId, specification, variant));
             }
         } catch (RuntimeException failure) {
             throw new IOException("Invalid minigame manifest", failure);
@@ -237,9 +251,11 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             if (pending != null) {
                 pending.slug = entry.getKey();
                 pending.serverId = entry.getValue().serverId;
+                pending.variant = entry.getValue().variant;
             } else {
                 Instance instance = new Instance();
                 instance.template = entry.getValue().template;
+                instance.variant = entry.getValue().variant;
                 instance.requestId = entry.getValue().spawnRequestId == null ? UUID.randomUUID().toString() : entry.getValue().spawnRequestId;
                 instance.slug = entry.getKey();
                 instance.serverId = entry.getValue().serverId;
@@ -253,19 +269,21 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 instances.add(instance);
             }
             Instance bound = instances.stream().filter(instance -> entry.getKey().equals(instance.slug)).findFirst().orElseThrow();
+            bound.variant = entry.getValue().variant;
             bound.retiredTarget = registeredTarget(entry.getKey(), entry.getValue()).orElse(bound.retiredTarget);
             if (bound.specification == null) {
                 bound.specification = entry.getValue().specification.deepCopy();
             }
             if (Set.of("ready", "provisioning").contains(bound.state)
-                    && !compatible(bound.specification, nextSpecifications.get(bound.template))) {
+                    && !compatible(bound.specification, currentSpecification(bound))) {
                 end(bound, false);
             }
             if (settings(bound).permanent()
-                    && !compatible(bound.specification, nextSpecifications.get(bound.template))) {
+                    && !compatible(bound.specification, currentSpecification(bound))) {
                 end(bound, false);
             }
         }
+        cancelUnavailableQueues();
         save();
     }
 
@@ -304,15 +322,37 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             if (closed || persistenceFailed || control == null) {
                 throw new IllegalArgumentException("Minigame matchmaking is unavailable.");
             }
-            String requested = String.join(" ", java.util.Arrays.copyOfRange(arguments, 1, arguments.length));
+            List<String> names = new ArrayList<>();
+            String variant = "";
+            boolean variantSeen = false;
+            for (int index = 1; index < arguments.length; index++) {
+                if (arguments[index].equals("--variant")) {
+                    if (variantSeen || index + 1 >= arguments.length) {
+                        throw new IllegalArgumentException("Usage: /minigame join <template> [--variant <name>]");
+                    }
+                    variantSeen = true;
+                    variant = arguments[++index];
+                    if (!variant.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+                        throw new IllegalArgumentException("Invalid minigame variant.");
+                    }
+                } else if (arguments[index].startsWith("--")) {
+                    throw new IllegalArgumentException("Unknown minigame option.");
+                } else {
+                    names.add(arguments[index]);
+                }
+            }
+            String requested = String.join(" ", names);
             String template = templates.keySet().stream().filter(name -> name.equalsIgnoreCase(requested)).findFirst()
                     .orElseThrow(() -> new IllegalArgumentException("Unknown minigame template."));
-            MinigameSpec spec = templates.get(template);
+            MinigameSpec spec = MinigameSpec.parse(MinigameSpec.variant(templateSpecifications.get(template), variant));
+            if (!spec.enabled()) {
+                throw new IllegalArgumentException("This minigame is disabled.");
+            }
             if (!configured(template)) {
                 throw new IllegalArgumentException("This minigame needs its template API key configured by an administrator.");
             }
             List<UUID> members = parties.members(actor);
-            if (!spec.teamfree() && members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
+            if (spec.teamPolicy().equals("balanced") && !spec.teamfree() && members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
                 throw new IllegalArgumentException("Your party is too large for this minigame.");
             }
             for (UUID member : members) {
@@ -321,8 +361,9 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                     throw new IllegalArgumentException("A party member lacks permission or is already queued or playing.");
                 }
             }
-            queues.computeIfAbsent(template, ignored -> new ArrayList<>()).add(new Matchmaker.Group(actor, members));
-            tell(members, "Queued for " + template + ".");
+                queues.computeIfAbsent(queueKey(template, variant), ignored -> new ArrayList<>()).add(new Matchmaker.Group(actor, members));
+                tell(members, "Queued for " + template + (variant.isEmpty() ? "" : " (" + variant + ")") + "."
+                    + (spec.teamPolicy().equals("roles") ? " Roles are randomized individually; parties may be split." : ""));
         } catch (IllegalArgumentException failure) {
             player.sendMessage(Component.text(failure.getMessage()));
         }
@@ -335,6 +376,16 @@ final class Minigames implements SimpleCommand, AutoCloseable {
 
     @Override
     public synchronized List<String> suggest(Invocation invocation) {
+        String[] arguments = invocation.arguments();
+        for (int index = 1; index < arguments.length; index++) {
+            if (arguments[index].equals("--variant")) {
+                String name = String.join(" ", java.util.Arrays.copyOfRange(arguments, 1, index));
+                return templateSpecifications.entrySet().stream().filter(entry -> entry.getKey().equalsIgnoreCase(name))
+                        .map(entry -> entry.getValue().getAsJsonObject("variants"))
+                        .filter(java.util.Objects::nonNull).findFirst()
+                        .map(variants -> List.copyOf(variants.keySet())).orElse(List.of());
+            }
+        }
         return invocation.arguments().length <= 1 ? List.of("join", "leave", "list") : List.copyOf(templates.keySet());
     }
 
@@ -369,7 +420,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 throw new IllegalArgumentException("This specific minigame instance is unavailable.");
             }
             MinigameSpec spec = settings(instance);
-            if (spec == null || !compatible(instance.specification, templateSpecifications.get(instance.template))) {
+            if (spec == null || !compatible(instance.specification, currentSpecification(instance))) {
                 throw new IllegalArgumentException("This specific minigame instance is unavailable.");
             }
             UUID actor = player.getUniqueId();
@@ -383,11 +434,14 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 }
                 return true;
             }
+            if (!enabled(instance.template)) {
+                throw new IllegalArgumentException("This minigame is disabled.");
+            }
             if (!parties.leader(actor).equals(actor)) {
                 throw new IllegalArgumentException("Only the party leader can join a minigame instance.");
             }
             List<UUID> members = parties.members(actor);
-            if (!spec.teamfree() && members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
+            if (spec.teamPolicy().equals("balanced") && !spec.teamfree() && members.size() > spec.teamSize() || members.size() > spec.maxPlayers()) {
                 throw new IllegalArgumentException("Your party is too large for this minigame.");
             }
             PendingTargetJoin pending = pendingTargetJoins.get(actor);
@@ -405,9 +459,12 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 if (!configured(instance.template)) {
                     throw new IllegalArgumentException("This minigame needs its template API key configured by an administrator.");
                 }
-                queues.computeIfAbsent(instance.template, ignored -> new ArrayList<>()).add(group);
+                queues.computeIfAbsent(queueKey(instance.template, instance.variant), ignored -> new ArrayList<>()).add(group);
                 output.accept("Waiting for minPlayers (" + spec.minPlayers() + ") in the normal " + instance.template
-                        + " queue, not direct instance entry; use /minigame join " + instance.template + ".");
+                    + (instance.variant.isEmpty() ? "" : " (" + instance.variant + ")")
+                    + " queue, not direct instance entry; use /minigame join " + instance.template
+                    + (instance.variant.isEmpty() ? "" : " --variant " + instance.variant) + "."
+                    + (spec.teamPolicy().equals("roles") ? " Roles are randomized individually; parties may be split." : ""));
                 return true;
             }
             List<UUID> additions = members.stream().filter(member -> instance.roster.stream()
@@ -429,6 +486,9 @@ final class Minigames implements SimpleCommand, AutoCloseable {
     }
 
     private boolean admitTarget(Instance instance, PendingTargetJoin pending, long now) {
+        if (!enabled(instance.template)) {
+            return false;
+        }
         Binding binding = bindings.get(pending.target.slug());
         if (binding == null || !binding.serverId.equals(pending.target.serverId())
                 || registeredTarget(pending.target.slug(), binding).isEmpty()
@@ -441,7 +501,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         }
         MinigameSpec spec = settings(instance);
         List<Matchmaker.Group> selected = new ArrayList<>(List.of(pending.group));
-        Matchmaker.Match match = Matchmaker.select(selected, spec.teams(), spec.teamSize(), 1, spec.maxPlayers(), assignments(instance));
+        Matchmaker.Match match = Matchmaker.select(selected, spec, 1, assignments(instance));
         pendingTargetJoins.remove(pending.group.leader());
         if (match == null) {
             pending.output.accept("This specific minigame instance has insufficient capacity for your whole party.");
@@ -506,6 +566,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             return;
         }
         long now = clock.getAsLong();
+        cancelUnavailableQueues();
         queues.values().forEach(queue -> queue.removeIf(group -> !validGroup(group)));
         for (Instance instance : List.copyOf(instances)) {
             MinigameSpec spec = settings(instance);
@@ -546,12 +607,12 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 if (occupants(instance).isEmpty()) {
                     submit(instance, () -> cleanup(instance));
                 }
-            } else if (instance.state.equals("provisioning")) {
+            } else if (instance.state.equals("provisioning") && enabled(instance.template)) {
                 submit(instance, () -> provision(instance));
             } else if (instance.state.equals("unavailable") && spec != null && spec.permanent()
                     && !instance.externallyDeleted && instance.heartbeat == 0 && instance.matchId == null
-                    && templates.containsKey(instance.template)
-                    && compatible(instance.specification, templateSpecifications.get(instance.template))) {
+                    && enabled(instance.template)
+                    && compatible(instance.specification, currentSpecification(instance))) {
                 submit(instance, () -> recoverStartup(instance));
             }
         }
@@ -560,8 +621,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             Instance instance = instances.stream().filter(value -> pending.target.serverId().equals(value.serverId)
                     && pending.target.slug().equals(value.slug)).findFirst().orElse(null);
             if (now >= pending.deadline || !validGroup(pending.group) || instance == null || instance.externallyDeleted
-                    || instance.state.equals("ending") || !templates.containsKey(instance.template)
-                    || !compatible(instance.specification, templateSpecifications.get(instance.template))
+                    || instance.state.equals("ending") || !enabled(instance.template)
+                    || !compatible(instance.specification, currentSpecification(instance))
                     || pending.group.players().stream().anyMatch(player -> queuedOrPlaying(player, instance, entry.getKey()))) {
                 pendingTargetJoins.remove(entry.getKey());
                 pending.output.accept("Specific-instance join expired or became unavailable; no other server was requested.");
@@ -571,61 +632,118 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         }
         for (var template : templates.entrySet()) {
             String name = template.getKey();
-            MinigameSpec spec = template.getValue();
-            List<Matchmaker.Group> queue = queues.computeIfAbsent(name, ignored -> new ArrayList<>());
-            if (spec.nativeLobby()) {
-                for (Instance nativeInstance : instances) {
-                    if (name.equals(nativeInstance.template) && nativeInstance.state.equals("running")
-                            && !nativeInstance.transferPending && nativeInstance.rosterJoined
-                            && occupants(nativeInstance).stream().map(Player::getUniqueId).collect(java.util.stream.Collectors.toSet())
-                                .containsAll(assignments(nativeInstance).keySet())
-                            && now - nativeInstance.heartbeat < 5000
-                            && compatible(nativeInstance.specification, templateSpecifications.get(name))) {
-                        Matchmaker.Match additions = Matchmaker.select(queue, spec.teams(), spec.teamSize(), 1,
-                                spec.maxPlayers(), assignments(nativeInstance));
-                        if (additions != null) {
-                            admit(nativeInstance, additions, queue, now);
+            if (!template.getValue().enabled()) {
+                continue;
+            }
+            List<String> variants = new ArrayList<>(List.of(""));
+            JsonObject definitions = templateSpecifications.get(name).getAsJsonObject("variants");
+            if (definitions != null) {
+                variants.addAll(definitions.keySet());
+            }
+            for (String variant : variants) {
+                JsonObject resolved = MinigameSpec.variant(templateSpecifications.get(name), variant);
+                MinigameSpec spec = MinigameSpec.parse(resolved);
+                List<Matchmaker.Group> queue = queues.computeIfAbsent(queueKey(name, variant), ignored -> new ArrayList<>());
+                if (spec.nativeLobby()) {
+                    for (Instance nativeInstance : instances) {
+                        if (name.equals(nativeInstance.template) && variant.equals(nativeInstance.variant) && nativeInstance.state.equals("running")
+                                && !nativeInstance.transferPending && nativeInstance.rosterJoined
+                                && occupants(nativeInstance).stream().map(Player::getUniqueId).collect(java.util.stream.Collectors.toSet())
+                                    .containsAll(assignments(nativeInstance).keySet())
+                                && now - nativeInstance.heartbeat < 5000
+                                && compatible(nativeInstance.specification, resolved)) {
+                            Matchmaker.Match additions = Matchmaker.select(queue, settings(nativeInstance), 1, assignments(nativeInstance));
+                            if (additions != null) {
+                                admit(nativeInstance, additions, queue, now);
+                            }
                         }
                     }
                 }
-            }
-            Instance available = instances.stream().filter(instance -> name.equals(instance.template) && instance.state.equals("ready")
-                    && (instance.specification == null || compatible(instance.specification, templateSpecifications.get(name)))
-                    && instance.heartbeat > 0 && now - instance.heartbeat < 5000).findFirst().orElse(null);
-            Matchmaker.Match match = Matchmaker.select(queue, spec.teams(), spec.teamSize(), spec.nativeLobby() ? 1 : spec.minPlayers(), spec.maxPlayers());
-            if (spec.nativeLobby() && instances.stream().anyMatch(instance -> name.equals(instance.template)
-                    && Set.of("joining", "running").contains(instance.state)
-                    && compatible(instance.specification, templateSpecifications.get(name))
-                    && Matchmaker.select(queue, spec.teams(), spec.teamSize(), 1, spec.maxPlayers(), assignments(instance)) != null)) {
-                match = null;
-            }
-            if (available != null && match != null) {
-                reserve(available, match, queue, now);
-            }
-            long ready = instances.stream().filter(instance -> name.equals(instance.template)
-                    && (spec.permanent() ? !instance.state.equals("ending")
-                        : Set.of("ready", "provisioning").contains(instance.state))).count();
-            long total = instances.stream().filter(instance -> name.equals(instance.template)).count();
-                boolean waitingPermanent = spec.permanent() && instances.stream().anyMatch(instance -> name.equals(instance.template)
-                    && Set.of("ready", "provisioning", "unavailable").contains(instance.state));
-                long demand = match != null && available == null && !waitingPermanent ? spec.permanent() ? ready + 1 : 1 : 0;
-                long wanted = Math.max(spec.readyServers(), demand);
-            if (ready < wanted && total < spec.maxInstances() && instances.size() < 100 && configured(name)) {
-                Instance instance = new Instance();
-                instance.template = name;
-                instance.requestId = UUID.randomUUID().toString();
-                instance.created = now;
-                instance.specification = templateSpecifications.get(name).deepCopy();
-                try {
-                    captureLifecycleConfiguration(instance, false);
-                } catch (IOException failure) {
-                    continue;
+                Instance available = instances.stream().filter(instance -> name.equals(instance.template) && variant.equals(instance.variant) && instance.state.equals("ready")
+                        && (instance.specification == null || compatible(instance.specification, resolved))
+                        && instance.heartbeat > 0 && now - instance.heartbeat < 5000).findFirst().orElse(null);
+                Matchmaker.Match match = Matchmaker.select(queue, spec, spec.nativeLobby() ? 1 : spec.minPlayers(), Map.of());
+                if (spec.nativeLobby() && instances.stream().anyMatch(instance -> name.equals(instance.template) && variant.equals(instance.variant)
+                        && Set.of("joining", "running").contains(instance.state)
+                        && compatible(instance.specification, resolved)
+                        && Matchmaker.select(queue, settings(instance), 1, assignments(instance)) != null)) {
+                    match = null;
                 }
-                instances.add(instance);
-                save();
-                lifecycleLog("preparing", instance);
+                if (available != null && match != null) {
+                    reserve(available, match, queue, now);
+                }
+                long ready = instances.stream().filter(instance -> name.equals(instance.template) && variant.equals(instance.variant)
+                        && (spec.permanent() ? !instance.state.equals("ending")
+                            : Set.of("ready", "provisioning").contains(instance.state))).count();
+                long total = instances.stream().filter(instance -> name.equals(instance.template)).count();
+                boolean waitingPermanent = spec.permanent() && instances.stream().anyMatch(instance -> name.equals(instance.template) && variant.equals(instance.variant)
+                        && Set.of("ready", "provisioning", "unavailable").contains(instance.state));
+                long demand = match != null && available == null && !waitingPermanent ? spec.permanent() ? ready + 1 : 1 : 0;
+                long wanted = Math.max(variant.isEmpty() ? spec.readyServers() : 0, demand);
+                if (ready < wanted && total < spec.maxInstances() && instances.size() < 100 && configured(name)) {
+                    Instance instance = new Instance();
+                    instance.template = name;
+                    instance.variant = variant;
+                    instance.requestId = UUID.randomUUID().toString();
+                    instance.created = now;
+                    instance.specification = resolved.deepCopy();
+                    try {
+                        captureLifecycleConfiguration(instance, false);
+                    } catch (IOException failure) {
+                        continue;
+                    }
+                    instances.add(instance);
+                    save();
+                    lifecycleLog("preparing", instance);
+                }
             }
         }
+    }
+
+    private static String queueKey(String template, String variant) {
+        return variant == null || variant.isEmpty() ? template : template + '\u0000' + variant;
+    }
+
+    private boolean enabled(String template) {
+        MinigameSpec spec = templates.get(template);
+        return spec != null && spec.enabled();
+    }
+
+    private JsonObject currentSpecification(Instance instance) {
+        JsonObject base = templateSpecifications.get(instance.template);
+        if (base == null) {
+            return null;
+        }
+        try {
+            return MinigameSpec.variant(base, instance.variant);
+        } catch (IllegalArgumentException failure) {
+            return null;
+        }
+    }
+
+    private void cancelUnavailableQueues() {
+        queues.entrySet().removeIf(entry -> {
+            int separator = entry.getKey().indexOf('\u0000');
+            String template = separator < 0 ? entry.getKey() : entry.getKey().substring(0, separator);
+            String variant = separator < 0 ? "" : entry.getKey().substring(separator + 1);
+            JsonObject base = templateSpecifications.get(template);
+            boolean available = enabled(template) && (variant.isEmpty()
+                    || base.has("variants") && base.getAsJsonObject("variants").has(variant));
+            if (!available) {
+                entry.getValue().forEach(group -> tell(group.players(), "Minigame queue removed: this template or variant is unavailable or disabled."));
+            }
+            return !available;
+        });
+        pendingTargetJoins.entrySet().removeIf(entry -> {
+            PendingTargetJoin pending = entry.getValue();
+            Instance instance = instances.stream().filter(value -> pending.target.serverId().equals(value.serverId)
+                    && pending.target.slug().equals(value.slug)).findFirst().orElse(null);
+            if (instance == null || !enabled(instance.template) || currentSpecification(instance) == null) {
+                pending.output.accept("Specific-instance join cancelled: this minigame is unavailable or disabled.");
+                return true;
+            }
+            return false;
+        });
     }
 
     private boolean configured(String template) {
@@ -685,7 +803,9 @@ final class Minigames implements SimpleCommand, AutoCloseable {
     }
 
     private MinigameSpec settings(Instance instance) {
-        return instance.specification == null ? templates.get(instance.template) : MinigameSpec.parse(instance.specification);
+        JsonObject specification = instance.specification == null ? currentSpecification(instance)
+                : MinigameSpec.variant(instance.specification, instance.specification.has("variants") ? instance.variant : "");
+        return specification == null ? null : MinigameSpec.parse(specification);
     }
 
     private static boolean compatible(JsonObject instance, JsonObject template) {
@@ -698,6 +818,10 @@ final class Minigames implements SimpleCommand, AutoCloseable {
         current.remove("maxInstances");
         saved.remove("readyServers");
         current.remove("readyServers");
+        saved.remove("enabled");
+        current.remove("enabled");
+        saved.remove("variants");
+        current.remove("variants");
         return saved.equals(current);
     }
 
@@ -747,8 +871,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
     }
 
     private void lifecycleLog(String event, Instance instance) {
-        logger.info("Minigame {} template={} instanceId={} requestId={} rosterVersion={} players={}",
-                event, safeLog(instance.template), instance.serverId, instance.requestId, instance.rosterVersion, instance.roster.size());
+        logger.info("Minigame {} template={} variant={} instanceId={} requestId={} rosterVersion={} players={}",
+            event, safeLog(instance.template), safeLog(instance.variant), instance.serverId, instance.requestId, instance.rosterVersion, instance.roster.size());
     }
 
     private static String safeLog(String message) {
@@ -783,7 +907,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             MinecraftInstanceClient client = lifecycleClient(instance);
             MinecraftInstanceClient.SpawnedInstance target;
             synchronized (this) {
-                if (!instance.state.equals("provisioning")) {
+                if (!instance.state.equals("provisioning") || templates.containsKey(instance.template) && !enabled(instance.template)) {
                     return;
                 }
                 Binding binding = bindings.get(instance.slug);
@@ -791,7 +915,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                     return;
                 }
             }
-            target = client.spawnWithTarget(instance.template, UUID.fromString(instance.requestId));
+            target = client.spawnWithTarget(instance.template, UUID.fromString(instance.requestId), instance.variant);
             synchronized (this) {
                 if (target != null) {
                     instance.slug = target.slug();
@@ -824,7 +948,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             MinecraftInstanceClient client;
             String serverId;
             synchronized (this) {
-                if (!instance.state.equals("unavailable") || instance.externallyDeleted || instance.heartbeat != 0) {
+                if (!instance.state.equals("unavailable") || instance.externallyDeleted || instance.heartbeat != 0
+                    || !enabled(instance.template)) {
                     return;
                 }
                 instance.retryAfter = clock.getAsLong() + 60000;
@@ -834,7 +959,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             if (serverId != null) {
                 client.power(instance.template, UUID.fromString(serverId), true);
             } else {
-                var target = client.spawnWithTarget(instance.template, UUID.fromString(instance.requestId));
+                var target = client.spawnWithTarget(instance.template, UUID.fromString(instance.requestId), instance.variant);
                 synchronized (this) {
                     if (target != null) {
                         instance.slug = target.slug();
@@ -944,8 +1069,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                     tell(group.players(), "Specific-instance join cancelled; no other server was requested.");
                     continue;
                 }
-                if (validGroup(group) && group.players().stream().noneMatch(this::queuedOrPlaying)) {
-                    queues.computeIfAbsent(instance.template, ignored -> new ArrayList<>()).add(group);
+                if (enabled(instance.template) && currentSpecification(instance) != null && validGroup(group) && group.players().stream().noneMatch(this::queuedOrPlaying)) {
+                    queues.computeIfAbsent(queueKey(instance.template, instance.variant), ignored -> new ArrayList<>()).add(group);
                     tell(group.players(), "Match cancelled because not everyone joined; your party was requeued.");
                 }
             }
@@ -977,8 +1102,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                     tell(group.players(), "Specific-instance join cancelled; no other server was requested.");
                     continue;
                 }
-                if (validGroup(group) && group.players().stream().noneMatch(this::queuedOrPlaying)) {
-                    queues.computeIfAbsent(instance.template, ignored -> new ArrayList<>()).add(group);
+                if (enabled(instance.template) && currentSpecification(instance) != null && validGroup(group) && group.players().stream().noneMatch(this::queuedOrPlaying)) {
+                    queues.computeIfAbsent(queueKey(instance.template, instance.variant), ignored -> new ArrayList<>()).add(group);
                     tell(group.players(), "Match cancelled because not everyone joined; your party was requeued.");
                 }
             }
@@ -1157,7 +1282,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             instance.retiredTarget = registeredTarget(instance.slug, liveBinding).orElse(instance.retiredTarget);
         }
         if (permanent && !instance.externallyDeleted && instance.state.equals("unavailable")
-                && compatible(instance.specification, templateSpecifications.get(instance.template))) {
+            && enabled(instance.template) && compatible(instance.specification, currentSpecification(instance))) {
             if (instance.matchId == null && state.equals("ready") && reportedMatch == null && players.isEmpty()) {
                 instance.state = "ready";
                 save();
@@ -1177,7 +1302,8 @@ final class Minigames implements SimpleCommand, AutoCloseable {
                 lifecycleLog("recovering roster", instance);
             }
         }
-        if (permanent && instance.state.equals("running") && state.equals("ready") && reportedMatch == null && players.isEmpty()) {
+        if (permanent && enabled(instance.template) && instance.state.equals("running")
+            && state.equals("ready") && reportedMatch == null && players.isEmpty()) {
             instance.state = "joining";
             instance.acknowledgedRosterVersion = 0;
             instance.transferPending = true;
@@ -1265,6 +1391,7 @@ final class Minigames implements SimpleCommand, AutoCloseable {
             }
         }
         JsonObject response = new JsonObject();
+        response.addProperty("variant", instance.variant);
         response.addProperty("state", instance.state.equals("provisioning") ? "ready" : instance.state);
         if (instance.matchId != null) {
             response.addProperty("matchId", instance.matchId);

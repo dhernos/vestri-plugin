@@ -182,7 +182,11 @@ final class MinecraftInstanceClient {
     }
 
     SpawnedInstance spawnWithTarget(String template, UUID requestId) throws IOException, InterruptedException {
-        return parseTarget(spawnResponse(template, requestId));
+        return spawnWithTarget(template, requestId, "");
+    }
+
+    SpawnedInstance spawnWithTarget(String template, UUID requestId, String variant) throws IOException, InterruptedException {
+        return parseTarget(spawnResponse(template, requestId, variant));
     }
 
     SpawnedInstance findPreparation(String template, UUID requestId) throws IOException, InterruptedException {
@@ -224,8 +228,18 @@ final class MinecraftInstanceClient {
     }
 
     private JsonObject spawnResponse(String template, UUID requestId) throws IOException, InterruptedException {
+        return spawnResponse(template, requestId, "");
+    }
+
+    private JsonObject spawnResponse(String template, UUID requestId, String variant) throws IOException, InterruptedException {
         JsonObject body = new JsonObject();
         body.addProperty("requestId", requestId.toString());
+        if (variant != null && !variant.isEmpty()) {
+            if (!variant.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,63}")) {
+                throw new IllegalArgumentException("Invalid minigame variant");
+            }
+            body.addProperty("variant", variant);
+        }
         for (int attempt = 0; ; attempt++) {
             try {
                 return request(template, "POST", "", body.toString());
