@@ -181,6 +181,9 @@ class MinigameAgentTest {
                         var root = com.google.gson.JsonParser.parseString(phasedConfig()).getAsJsonObject();
                         var entries = root.getAsJsonObject("spec").getAsJsonObject("lifecycle").getAsJsonArray(phase);
                         var entry = entries.get(0).deepCopy();
+                        for (String other : List.of("onAllJoined", "teamCommands", "startCommands")) {
+                                if (!other.equals(phase)) root.getAsJsonObject("spec").getAsJsonObject("lifecycle").remove(other);
+                        }
                         while (entries.size() < 100) entries.add(entry.deepCopy());
                         assertNotNull(MinigameAgent.configuration(root.toString()));
                         entries.add(entry);
@@ -192,7 +195,7 @@ class MinigameAgentTest {
                         roster.add(new MinigameAgent.Member(UUID.randomUUID(), "Player" + index, "red"));
                 }
                 var config = new MinigameAgent.Configuration(parsed.endpoint(), parsed.token(), parsed.teams(), parsed.trigger(),
-                                java.util.Collections.nCopies(8, new MinigameAgent.Action("prepare {player}", "player")), null,
+                                java.util.Collections.nCopies(20, new MinigameAgent.Action("prepare {player}", "player")), null,
                                 "vestri", "temporary", null, List.of(new MinigameAgent.TeamCommand("red", "assign {player}")), List.of());
                 assertThrows(IllegalArgumentException.class, () -> MinigameAgent.expand(config, roster, match));
                 try (var agent = new MinigameAgent(null, config, data.resolve("expansion-limit.json"))) {
@@ -307,6 +310,7 @@ class MinigameAgentTest {
                         }
                 }
                 var nativeConfig = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
                                 .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
                 try (var nativeAgent = new MinigameAgent(null, nativeConfig, data.resolve("unguarded-native.json"))) {
                         nativeAgent.apply(new MinigameAgent.Control("starting", match, roster, 1), Set.of(), command -> fail("Native phase"));
@@ -672,6 +676,7 @@ class MinigameAgentTest {
     @Test
         void nativeLobbyAdmitsIncrementalRosterWithoutStartupAndFailsOnRestart() throws Exception {
                 var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
                                 .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
                 var first = new MinigameAgent.Member(match, "Player", "red");
                 var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");
@@ -748,6 +753,7 @@ class MinigameAgentTest {
         @Test
         void nativeEmptyLobbyStillNeedsReadyAndLogEndWorksBeforeAllJoined() throws Exception {
                 var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
                                 .replace("\"teams\":[\"red\",\"blue\"]", "\"lobbyMode\":\"plugin\",\"teams\":[]"));
                 Path path = data.resolve("empty-native.json");
                 try (var agent = new MinigameAgent(null, config, path)) {
@@ -768,6 +774,7 @@ class MinigameAgentTest {
         @Test
         void nativePersistenceFailureDoesNotAcknowledgeOrAdmitAdditions() throws Exception {
                 var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580")
+                                .replace("[{\"command\":\"start {matchId}\"}]", "[]")
                                 .replace("\"teams\":", "\"lobbyMode\":\"plugin\",\"teams\":"));
                 var first = new MinigameAgent.Member(match, "Player", "red");
                 var second = new MinigameAgent.Member(UUID.randomUUID(), "Second", "blue");

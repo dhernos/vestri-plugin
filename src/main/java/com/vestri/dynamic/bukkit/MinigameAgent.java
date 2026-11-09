@@ -19,8 +19,10 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -41,11 +43,15 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
+import java.util.random.RandomGenerator;
 import java.util.regex.Pattern;
+import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.server.ServerLoadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -57,6 +63,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     private final Configuration config;
     private final MatchFence fence;
     private final Diagnostics diagnostics;
+    private final RandomGenerator random;
     private final AtomicReference<Control> incoming = new AtomicReference<>();
     private final AtomicBoolean endRequested = new AtomicBoolean();
     private final ScheduledExecutorService polling = Executors.newSingleThreadScheduledExecutor(task -> {
@@ -84,6 +91,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     private Logger endLogger;
     private volatile String trustedEndLogger;
     private PreStartGuard preStartGuard;
+    private final Map<UUID, JoinSession> joinSessions = new HashMap<>();
 
     private MinigameAgent(JavaPlugin plugin, Configuration config) throws IOException {
         this(plugin, config, plugin.getDataFolder().toPath().resolve("minigame-execution.json"));
@@ -95,9 +103,15 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     }
 
     MinigameAgent(JavaPlugin plugin, Configuration config, Path execution, Diagnostics diagnostics) throws IOException {
+        this(plugin, config, execution, diagnostics, RandomGenerator.getDefault());
+    }
+
+    MinigameAgent(JavaPlugin plugin, Configuration config, Path execution, Diagnostics diagnostics,
+            RandomGenerator random) throws IOException {
         this.plugin = plugin;
         this.config = config;
         this.diagnostics = diagnostics;
+        this.random = random;
         fence = new MatchFence(execution, config.teams(), config.lobbyMode(), config.instanceMode(),
             config.permanent() ? credentialBinding(config) : null);
         if (fence.roster() != null) {
@@ -172,6 +186,111 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
     }
 
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        if (closed || config.onPlayerJoin().isEmpty()) {
+            return;
+        }
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        JoinSession previous = joinSessions.get(uuid);
+        if (previous != null) {
+            if (previous.player == player) {
+                return;
+            }
+            previous.cancel();
+        }
+        JoinSession session = new JoinSession(player, uuid);
+        joinSessions.put(uuid, session);
+        scheduleJoin(session);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        UUID uuid = event.getPlayer().getUniqueId();
+        JoinSession session = joinSessions.get(uuid);
+        if (session != null && session.player == event.getPlayer()) {
+            joinSessions.remove(uuid);
+            session.cancel();
+        }
+    }
+
+    private void scheduleJoin(JoinSession session) {
+        session.task = plugin.getServer().getScheduler().runTaskLater(plugin, () -> runJoin(session), 1);
+    }
+
+    private boolean currentSession(JoinSession session) {
+        return !closed && joinSessions.get(session.uuid) == session && session.player.isOnline()
+                && plugin.getServer().getPlayer(session.uuid) == session.player;
+    }
+
+    private void runJoin(JoinSession session) {
+        session.task = null;
+        if (session.started || !currentSession(session)) {
+            return;
+        }
+        if (!allows(session.uuid)) {
+            if (!terminal() && ++session.waitTicks < 100) {
+                scheduleJoin(session);
+            } else {
+                session.started = true;
+                rejectJoin(session, 0, "none");
+            }
+            return;
+        }
+        session.started = true;
+        Member member = roster.stream().filter(candidate -> candidate.uuid().equals(session.uuid)).findFirst().orElseThrow();
+        List<CommandInvocation> commands = new ArrayList<>();
+        for (ExecutableCommand command : config.onPlayerJoin()) {
+            addInvocation(commands, command.command(), command.sender(), member, member.team(), fence.matchId());
+        }
+        for (int index = 0; index < commands.size(); index++) {
+            CommandInvocation invocation = commands.get(index);
+            boolean accepted;
+            try {
+                accepted = currentSession(session) && allows(session.uuid)
+                    && member.name().equals(session.player.getName())
+                        && executeInvocation(invocation, Map.of(session.uuid, session.player));
+            } catch (RuntimeException failure) {
+                accepted = false;
+            }
+            if (!accepted) {
+                rejectJoin(session, index + 1, invocation.sender());
+                return;
+            }
+        }
+        session.successful = true;
+    }
+
+    private void rejectJoin(JoinSession session, int index, String sender) {
+        diagnostics.logger.warning("Minigame join action failed: index=" + index + ", sender=" + sender
+                + ", player=" + session.uuid + "; remaining join commands aborted; disconnecting this session.");
+        if (currentSession(session)) {
+            session.player.kickPlayer("Minigame admission failed. Please reconnect.");
+        }
+    }
+
+    private static final class JoinSession {
+        private final Player player;
+        private final UUID uuid;
+        private BukkitTask task;
+        private int waitTicks;
+        private boolean started;
+        private boolean successful;
+
+        private JoinSession(Player player, UUID uuid) {
+            this.player = player;
+            this.uuid = uuid;
+        }
+
+        private void cancel() {
+            if (task != null) {
+                task.cancel();
+                task = null;
+            }
+        }
+    }
+
     boolean allows(UUID player) {
         return !closed && readySignalled && !terminal() && allowed.contains(player);
     }
@@ -187,6 +306,10 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 + ", roster=" + roster.size() + ", frozen=" + frozenPlayers
                 + ", setupCommands=" + config.actions().size() + ", teamCommands=" + config.teamCommands().size()
                 + ", startCommands=" + config.startCommands().size()
+                + ", joinCommands=" + config.onPlayerJoin().size()
+                + ", playerSenderCommands=" + playerSenderCommands(config)
+                + ", serverSenderCommands=" + (config.actions().size() + config.teamCommands().size()
+                    + config.startCommands().size() + config.onPlayerJoin().size() - playerSenderCommands(config))
                 + ", endPattern=" + (config.endPattern() == null ? "absent" : "configured")
                 + ", configuredLogger=" + config.loggerName() + ", trustedLogger=" + trustedEndLogger;
     }
@@ -288,18 +411,39 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             return;
         }
         Control response = incoming.getAndSet(null);
-        Set<UUID> online = new HashSet<>();
-        plugin.getServer().getOnlinePlayers().forEach(player -> online.add(player.getUniqueId()));
-        apply(response, online, command -> plugin.getServer().dispatchCommand(plugin.getServer().getConsoleSender(), command));
-        report = statusReport(online);
+        Map<UUID, Player> online = new HashMap<>();
+        plugin.getServer().getOnlinePlayers().forEach(player -> online.put(player.getUniqueId(), player));
+        applyInvocations(response, online.keySet(), invocation -> executeInvocation(invocation, online));
+        report = statusReport(online.keySet());
+    }
+
+    boolean executeInvocation(CommandInvocation invocation, Map<UUID, Player> online) {
+        if (closed || terminal() || plugin == null || !plugin.getServer().isPrimaryThread()) {
+            return false;
+        }
+        if (invocation.player() == null) {
+            return plugin.getServer().dispatchCommand(plugin.getServer().getConsoleSender(), invocation.command());
+        }
+        Player player = online.get(invocation.player());
+        return player != null && allows(invocation.player()) && player.isOnline()
+                && plugin.getServer().getPlayer(invocation.player()) == player
+            && roster.stream().anyMatch(member -> member.uuid().equals(invocation.player())
+                && member.name().equals(player.getName()))
+                && player.performCommand(invocation.command());
     }
 
     String statusReport(Set<UUID> online) {
-        return JSON.toJson(new Report(state, fence.matchId(), online.stream().map(UUID::toString).sorted().toList(),
+        return JSON.toJson(new Report(state, fence.matchId(), online.stream()
+            .filter(uuid -> !joinSessions.containsKey(uuid) || joinSessions.get(uuid).successful)
+            .map(UUID::toString).sorted().toList(),
             fence.rosterVersion()));
     }
 
     void apply(Control response, Set<UUID> online, Predicate<String> execute) {
+        applyInvocations(response, online, invocation -> execute.test(invocation.command()));
+    }
+
+    void applyInvocations(Control response, Set<UUID> online, Predicate<CommandInvocation> execute) {
         if (endRequested.getAndSet(false)) {
             end();
         }
@@ -332,23 +476,34 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 state = "joining";
             }
             if (!readySignalled || !response.state().equals("starting") || roster.isEmpty()
-                    || !online.containsAll(allowed) || !fence.claimStartup(response.matchId())) {
+                    || !online.containsAll(allowed)
+                    || joinSessions.values().stream().anyMatch(session -> allowed.contains(session.uuid) && !session.successful)
+                    || !fence.claimStartup(response.matchId())) {
                 return;
             }
             state = "starting";
-            List<String> commands = expand(config, roster, response.matchId());
-            diagnostics.logger.info("Minigame startup on Paper console: matchId=" + response.matchId()
+            List<CommandInvocation> commands = expandInvocations(config, roster, online, response.matchId(), random);
+            diagnostics.logger.info("Minigame startup on Paper: matchId=" + response.matchId()
                     + ", players=" + roster.size() + ", expandedCommands=" + commands.size());
-            int[] commandIndex = {0};
-            boolean success = dispatch(commands, command -> {
-                commandIndex[0]++;
-                boolean accepted = !terminal() && execute.test(command);
-                if (!accepted) {
-                    diagnostics.logger.warning("Minigame Paper console command rejected at index=" + commandIndex[0]
-                            + "; remaining startup commands aborted and players remain protected.");
+            boolean success = true;
+            for (int commandIndex = 0; commandIndex < commands.size(); commandIndex++) {
+                CommandInvocation invocation = commands.get(commandIndex);
+                boolean accepted;
+                try {
+                    accepted = !closed && !terminal()
+                            && (invocation.player() == null || online.contains(invocation.player()))
+                            && execute.test(invocation);
+                } catch (RuntimeException failure) {
+                    accepted = false;
                 }
-                return accepted;
-            });
+                if (!accepted) {
+                    diagnostics.logger.warning("Minigame Paper command rejected at index=" + (commandIndex + 1)
+                            + ", sender=" + invocation.sender() + ", player=" + invocation.player()
+                            + "; remaining startup commands aborted and players remain protected.");
+                    success = false;
+                    break;
+                }
+            }
             if (!terminal()) {
                 state = success ? "running" : "failed";
                 diagnostics.logger.info("Minigame startup completed on Paper: " + statusSummary());
@@ -464,6 +619,14 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         return true;
     }
 
+    static String commandSender(JsonObject command) {
+        String sender = command.has("sender") ? string(command.get("sender")) : "server";
+        if (!Set.of("server", "player").contains(sender)) {
+            throw new IllegalArgumentException("Command sender must be server or player");
+        }
+        return sender;
+    }
+
     @Override
     public void close() {
         closed = true;
@@ -478,6 +641,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         if (readyTask != null) {
             readyTask.cancel();
         }
+        joinSessions.values().forEach(JoinSession::cancel);
+        joinSessions.clear();
         HandlerList.unregisterAll(this);
         if (preStartGuard != null) {
             HandlerList.unregisterAll(preStartGuard);
@@ -531,8 +696,9 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 JsonObject entry = value.getAsJsonObject();
                 String command = string(entry.get("command"));
                 String forEach = entry.has("forEach") ? string(entry.get("forEach")) : "";
-                validateCommand(command, forEach, teams);
-                actions.add(new Action(command, forEach));
+                String sender = commandSender(entry);
+                validateCommand(command, forEach, teams, sender, false);
+                actions.add(new Action(command, forEach, sender));
             });
         }
         List<TeamCommand> teamCommands = new ArrayList<>();
@@ -545,21 +711,20 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 if (!teams.contains(team)) {
                     throw new IllegalArgumentException("Unknown command team");
                 }
-                validateCommand(command, "player", teams);
-                teamCommands.add(new TeamCommand(team, command));
+                String sender = commandSender(entry);
+                validateCommand(command, "player", teams, sender, false);
+                teamCommands.add(new TeamCommand(team, command, sender));
             });
         }
-        List<String> startCommands = new ArrayList<>();
+        List<ExecutableCommand> startCommands = new ArrayList<>();
         JsonArray starts = lifecycle.getAsJsonArray("startCommands");
         if (starts != null) {
-            starts.forEach(value -> {
-                String command = string(value);
-                validateCommand(command, "", teams);
-                startCommands.add(command);
-            });
+            starts.forEach(value -> startCommands.add(executableCommand(value, teams, false)));
         }
-        if (actions.size() > 100 || teamCommands.size() > 100 || startCommands.size() > 100) {
-            throw new IllegalArgumentException();
+        List<ExecutableCommand> onPlayerJoin = new ArrayList<>();
+        JsonArray joins = lifecycle.getAsJsonArray("onPlayerJoin");
+        if (joins != null) {
+            joins.forEach(value -> onPlayerJoin.add(executableCommand(value, teams, true)));
         }
         JsonObject end = lifecycle.getAsJsonObject("end");
         if (instanceMode.equals("permanent") && (!actions.isEmpty() || end == null || end.has("logPattern")
@@ -576,13 +741,38 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         }
         return new Configuration(URI.create(url.replaceAll("/$", "") + "/minigame/" + slug), token,
             List.copyOf(teams), trigger, List.copyOf(actions), pattern.isEmpty() ? null : Pattern.compile(pattern),
-            lobbyMode, instanceMode, loggerName, List.copyOf(teamCommands), List.copyOf(startCommands));
+            lobbyMode, instanceMode, loggerName, List.copyOf(teamCommands), List.copyOf(startCommands),
+            List.copyOf(onPlayerJoin));
+    }
+
+    private static ExecutableCommand executableCommand(com.google.gson.JsonElement value, List<String> teams,
+            boolean joining) {
+        String command;
+        String sender = "server";
+        if (!joining && value.isJsonPrimitive()) {
+            command = string(value);
+        } else {
+            JsonObject entry = value.getAsJsonObject();
+            if (entry.has("forEach")) {
+                throw new IllegalArgumentException("Lifecycle command must run once");
+            }
+            command = string(entry.get("command"));
+            sender = commandSender(entry);
+        }
+        validateCommand(command, "", teams, sender, joining);
+        return new ExecutableCommand(command, sender);
     }
 
     private static void validateCommand(String command, String scope, List<String> teams) {
+        validateCommand(command, scope, teams, "server", false);
+    }
+
+    private static void validateCommand(String command, String scope, List<String> teams, String sender,
+            boolean joining) {
         if (command.isBlank() || command.getBytes(StandardCharsets.UTF_8).length > 1024
                 || command.strip().startsWith("/") || command.chars().anyMatch(Character::isISOControl)
                 || !Set.of("", "team", "player").contains(scope)
+                || !Set.of("server", "player").contains(sender)
                 || (teams.isEmpty() && scope.equals("team"))) {
             throw new IllegalArgumentException();
         }
@@ -590,8 +780,10 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         while (placeholders.find()) {
             String placeholder = placeholders.group(1);
             if (!Set.of("matchId", "team", "player", "uuid").contains(placeholder)
-                    || (placeholder.equals("team") && (scope.isEmpty() || teams.isEmpty()))
-                    || (Set.of("player", "uuid").contains(placeholder) && !scope.equals("player"))) {
+                        || (placeholder.equals("team") && (teams.isEmpty()
+                            || (scope.isEmpty() && !sender.equals("player") && !joining)))
+                        || (Set.of("player", "uuid").contains(placeholder) && !scope.equals("player")
+                            && !sender.equals("player") && !joining)) {
                 throw new IllegalArgumentException();
             }
         }
@@ -732,8 +924,8 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 }
             }
         }
-        for (String command : config.startCommands()) {
-            commands.add(expand(command, "", "", "", matchId));
+        for (ExecutableCommand command : config.startCommands()) {
+            commands.add(expand(command.command(), "", "", "", matchId));
         }
         if (commands.size() > 4096) {
             throw new IllegalArgumentException("Too many lifecycle commands");
@@ -741,8 +933,98 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         return List.copyOf(commands);
     }
 
-    record Action(String command, String forEach) { }
-    record TeamCommand(String team, String command) { }
+    static List<CommandInvocation> expandInvocations(Configuration config, List<Member> roster, Set<UUID> online,
+            UUID matchId, RandomGenerator random) {
+        validateRoster(roster, config.teams());
+        List<CommandInvocation> commands = new ArrayList<>();
+        for (Action action : config.actions()) {
+            switch (action.forEach()) {
+                case "player" -> {
+                    for (Member member : roster) {
+                        addInvocation(commands, action.command(), action.sender(), member, member.team(), matchId);
+                    }
+                }
+                case "team" -> {
+                    for (String team : config.teams()) {
+                        List<Member> teamMembers = roster.stream().filter(candidate -> candidate.team().equals(team)).toList();
+                        Member member = action.sender().equals("player")
+                                ? selectMember(teamMembers, online, random) : null;
+                        if (action.sender().equals("player") && !teamMembers.isEmpty() && member == null) {
+                            throw new IllegalArgumentException("No online team sender");
+                        }
+                        if (!action.sender().equals("player") || member != null) {
+                            addInvocation(commands, action.command(), action.sender(), member, team, matchId);
+                        }
+                    }
+                }
+                case "" -> {
+                    Member member = action.sender().equals("player") ? selectMember(roster, online, random) : null;
+                    addInvocation(commands, action.command(), action.sender(), member,
+                            member == null ? "" : member.team(), matchId);
+                }
+                default -> throw new IllegalArgumentException("Invalid command scope");
+            }
+        }
+        for (TeamCommand command : config.teamCommands()) {
+            for (Member member : roster) {
+                if (command.team().equals(member.team())) {
+                    addInvocation(commands, command.command(), command.sender(), member, member.team(), matchId);
+                }
+            }
+        }
+        for (ExecutableCommand command : config.startCommands()) {
+            Member member = command.sender().equals("player") ? selectMember(roster, online, random) : null;
+            addInvocation(commands, command.command(), command.sender(), member,
+                    member == null ? "" : member.team(), matchId);
+        }
+        return List.copyOf(commands);
+    }
+
+    private static Member selectMember(List<Member> members, Set<UUID> online, RandomGenerator random) {
+        List<Member> candidates = members.stream().filter(member -> online.contains(member.uuid())).toList();
+        return candidates.isEmpty() ? null : candidates.get(random.nextInt(candidates.size()));
+    }
+
+    private static void addInvocation(List<CommandInvocation> commands, String command, String sender,
+            Member member, String team, UUID matchId) {
+        if (!Set.of("server", "player").contains(sender) || (sender.equals("player") && member == null)
+                || commands.size() >= 10_000) {
+            throw new IllegalArgumentException("Invalid or oversized command plan");
+        }
+        commands.add(new CommandInvocation(expand(command, member == null ? "" : member.name(),
+                member == null ? "" : member.uuid().toString(), team, matchId),
+                sender.equals("player") ? member.uuid() : null));
+    }
+
+    private static long playerSenderCommands(Configuration config) {
+        return config.actions().stream().filter(command -> command.sender().equals("player")).count()
+                + config.teamCommands().stream().filter(command -> command.sender().equals("player")).count()
+                + config.startCommands().stream().filter(command -> command.sender().equals("player")).count()
+                + config.onPlayerJoin().stream().filter(command -> command.sender().equals("player")).count();
+    }
+
+    record CommandInvocation(String command, UUID player) {
+        String sender() {
+            return player == null ? "server" : "player";
+        }
+    }
+
+    record ExecutableCommand(String command, String sender) {
+        ExecutableCommand(String command) {
+            this(command, "server");
+        }
+    }
+
+    record Action(String command, String forEach, String sender) {
+        Action(String command, String forEach) {
+            this(command, forEach, "server");
+        }
+    }
+    record TeamCommand(String team, String command, String sender) {
+        TeamCommand(String team, String command) {
+            this(team, command, "server");
+        }
+    }
     record Member(UUID uuid, String name, String team) { }
     record Control(String state, UUID matchId, List<Member> roster, int rosterVersion) {
         Control(String state, UUID matchId, List<Member> roster) {
@@ -752,15 +1034,23 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     record Report(String state, UUID matchId, List<String> players, int rosterVersion) { }
     record Configuration(URI endpoint, String token, List<String> teams, String trigger,
             List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode, String loggerName,
-            List<TeamCommand> teamCommands, List<String> startCommands) {
+            List<TeamCommand> teamCommands, List<ExecutableCommand> startCommands, List<ExecutableCommand> onPlayerJoin) {
         Configuration {
             if (!Set.of("temporary", "permanent").contains(instanceMode)
-                || (lobbyMode.equals("plugin") && (!teamCommands.isEmpty() || !startCommands.isEmpty()))
+                || (lobbyMode.equals("plugin") && (!actions.isEmpty() || !teamCommands.isEmpty() || !startCommands.isEmpty()))
+                || actions.size() + teamCommands.size() + startCommands.size() + onPlayerJoin.size() > 100
                 || (loggerName != null && !loggerName.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))
                     || (instanceMode.equals("permanent") && (!lobbyMode.equals("plugin")
                             || !actions.isEmpty() || endPattern != null))) {
                 throw new IllegalArgumentException("Invalid instance mode");
             }
+        }
+
+        Configuration(URI endpoint, String token, List<String> teams, String trigger,
+                List<Action> actions, Pattern endPattern, String lobbyMode, String instanceMode, String loggerName,
+                List<TeamCommand> teamCommands, List<String> startCommands) {
+            this(endpoint, token, teams, trigger, actions, endPattern, lobbyMode, instanceMode, loggerName,
+                    teamCommands, startCommands.stream().map(ExecutableCommand::new).toList(), List.of());
         }
 
         boolean permanent() {

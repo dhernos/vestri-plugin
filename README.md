@@ -866,10 +866,13 @@ minigame:
     teamCommands:
       - team: speedrunner
         command: "YOUR_SPEEDRUNNER_COMMAND {player}"
+        sender: player
       - team: hunter
         command: "YOUR_HUNTER_COMMAND {player}"
+        sender: player
     startCommands:
-      - "manhuntstart"
+      - command: "manhuntstart"
+        sender: player
     end:
       whenEmpty: true
       emptyGrace: 10s
@@ -879,10 +882,13 @@ minigame:
 
 This is a minimal two-speedrunner Manhunt settings example, not a gameplay
 plugin configuration. Replace `YOUR_SPEEDRUNNER_COMMAND` and
-`YOUR_HUNTER_COMMAND` with that installed plugin's actual role-assignment console
+`YOUR_HUNTER_COMMAND` with that installed plugin's actual role-assignment player
 commands; `manhuntstart` is the example final start command and must also match
-the installed plugin. Commands have no leading slash. The bridge does not
-implement game rules; the gameplay plugin actually starts the game.
+the installed plugin. Each assigned member executes their own role command;
+one random online roster member executes the start command. Grant the required
+gameplay-plugin permissions to those players. Commands have no leading slash.
+The bridge does not implement game rules; the gameplay plugin actually starts
+the game. The example's end settings are unchanged.
 
 `teamPolicy: roles` requires `lobbyMode: vestri`. Here exactly two individually
 selected players become `speedrunner` and everyone else becomes `hunter`.
@@ -894,21 +900,45 @@ individual players, not whole parties; this is ordinary randomized assignment,
 not a security-grade randomness guarantee.
 
 Startup order is `lifecycle.onAllJoined` setup actions, then
-`lifecycle.teamCommands` entries (each `{team, command}` runs once for every
+`lifecycle.teamCommands` entries (each `{team, command, sender?}` runs once for every
 player assigned to that exact team), then `lifecycle.startCommands` once-only
-final commands. Team commands support `{player}`, `{uuid}`, `{team}`, and
-`{matchId}`; final start commands accept only `{matchId}`. Together these arrays
-are limited to 100 configured commands.
+final commands. Commands accept `sender: server` (the default when omitted) or
+`sender: player`; other values, including null and an empty string, are invalid.
+Existing setup/team objects without a sender remain server commands. Start
+entries accept both legacy strings such as `"manhuntstart"` (server sender) and
+objects such as `{command: "manhuntstart", sender: player}`. Legacy strings stay
+strings in saved specs; object entries stay objects. All commands omit the
+leading slash. Setup, team, start, and `onPlayerJoin` arrays together are limited
+to 100 configured commands.
 
-An action without `forEach` runs once and can use `{matchId}`. `forEach: team`
-runs once per configured team and can also use `{team}`. `forEach: player` runs
-once per roster player and can use `{player}`, `{uuid}`, and `{team}` as well as
-`{matchId}`. Here `{player}` is the roster's Minecraft name, not an NPC placeholder.
+Server-sender setup without `forEach` runs once and can use `{matchId}`.
+`forEach: team` runs once per configured team and can also use `{team}`.
+`forEach: player` runs once per roster player with either sender and can use
+`{player}`, `{uuid}`, `{team}`, and `{matchId}`. With `sender: player`, that
+assigned player is also the executor. A player-sender per-team setup action
+selects one random online member of that team; an empty team has no player
+invocation. A once-only player-sender setup or start action selects one random
+eligible online match-roster player per action, not every player. Within each
+invocation, `{player}`, `{uuid}`, and `{team}` consistently refer to that selected
+executor. Team commands run per assigned member with either sender; player
+senders execute as that member, not as a random teammate. Server-sender final
+starts accept only `{matchId}`; player-sender starts also accept the selected
+player's placeholders. `{matchId}` is valid everywhere.
+
+Here `{player}` is the roster's Minecraft name, not an NPC placeholder.
 For team-based matches, the proxy precomputes assignments; balanced policy keeps
 whole parties on one team, whereas roles may split them. The per-player action
 uses that assignment, rather than choosing teams
-again on Paper. `{player}` and `{uuid}` are invalid outside player scope, and
-`{team}` requires team or player scope.
+again on Paper. For server setup, `{player}` and `{uuid}` require player scope,
+and `{team}` requires team or player scope. Player senders supply selected-player
+context even without player scope. `{team}` and `forEach: team` always require
+declared teams, including in variants.
+
+Paper dispatches server actions as its console sender and player actions through
+the actual player's `performCommand`, not `chat`. Player commands use normal
+permissions: no OP elevation, sudo, or fallback to console. This supports plugins
+that only accept player command senders, but the selected player must hold the
+plugin's required permission. Sender selection does not grant it.
 
 `teamPolicy: balanced` is the default. Twelve solos selected together for four
 teams of capacity four are distributed three per team. A party of four stays
@@ -994,7 +1024,9 @@ countdown, teams, and game state. This mode bypasses Vestri's `minPlayers`
 queue threshold and startup commands; `lifecycle.onAllJoined` **must be empty**.
 `lifecycle.teamCommands` and `lifecycle.startCommands` must also be empty or
 omitted: the backend rejects nonempty startup arrays in plugin mode rather than
-silently ignoring them. Native game start is controlled by the gameplay plugin.
+silently ignoring them. `lifecycle.onPlayerJoin` is accepted in both lobby modes,
+including permanent native instances; it is not a startup phase. Native game
+start is controlled by the gameplay plugin.
 Player bounds and `maxPlayers` still apply. For example, a minimal team-free
 native lobby with an explicit end signal is:
 
@@ -1044,11 +1076,30 @@ lifecycle:
   ready:
     trigger: serverLoad
   onAllJoined: []
+  onPlayerJoin:
+    - command: "ffa join"
+      sender: player
   end:
     returnPlayersTo: lobby
     deleteServer: false
     whenEmpty: false
 ```
+
+This permanent FFA example runs `ffa join` as the admitted player, without a
+leading slash. Install the matching FFA plugin and grant its join permission;
+the command is an integration example, not a command supplied by Vestri.
+
+`lifecycle.onPlayerJoin` is an ordered list of `{command, sender?}` objects;
+`sender` defaults to `server`, and `forEach` must be absent. Both senders use the
+joining player's `{player}`, `{uuid}`, and, when teams exist, `{team}` context,
+plus `{matchId}`. The player sender is always that joining player, never a
+random roster member. Paper schedules the list from `PlayerJoinEvent`, deferring
+one tick and waiting in one-tick steps until readiness and roster authorization
+allow execution (bounded to 100 ticks). It runs once per connection, runs again
+on a real rejoin, and is not replayed by control polling or roster updates.
+Disconnecting cancels pending work for that connection. A rejected/throwing join
+command aborts the remaining list and disconnects only that player; it does not
+mark the whole match failed. Managed startup waits for successful join actions.
 
 Permanent instances are not automatically deleted on game end or when empty.
 Paper ignores their explicit end signal. Failures, stale heartbeats, or
@@ -1075,21 +1126,28 @@ In Vestri-managed mode, matching can proceed as soon as the queued roster meets
 to fill to `maxPlayers`. This threshold is not a game-start timer. Actual startup
 actions run only after the entire assigned roster has joined Paper, not on a
 status ping or merely because the threshold was reached. Paper dispatches them
-as console commands on its main thread, once per match under the durable startup
+with their configured senders on its main thread, once per match under the durable startup
 fence. Setup, per-team commands, and final start commands run in that order.
 A rejected command
 fails startup and stops later commands. **Command ordering is not an asynchronous
 completion guarantee**: a command returning successfully can still have work in
-flight. Use a gameplay-plugin adapter or explicit signal when initialization must
+flight. The engine marks startup successful when dispatch succeeds, not when it
+verifies that the gameplay plugin actually started a game. A plugin may return
+success after a permission denial or other refusal. Use a gameplay-plugin adapter
+or explicit signal when initialization must
 finish before the next phase, rather than assuming sequential commands await it.
 
 Managed roster players remain guarded until successful dispatch of the final
 startup command (or successful completion of an empty command list). Coordinate
 movement, PvP/damage, world interactions, inventory actions, and player commands
 are blocked during joining/startup. Looking around is allowed, as are trusted
-plugin teleports needed for map setup. A startup failure keeps players guarded
+plugin teleports needed for map setup. Agent-issued programmatic player commands
+remain available through `performCommand`; this internal execution path does
+not allow players to bypass the guard by typing commands in chat. A startup failure keeps players guarded
 until evacuation/cleanup, not released into gameplay. Native plugin-owned
-lobbies do not install this pre-start guard or run Vestri's command phases.
+lobbies do not install this pre-start guard or run Vestri's startup phases;
+their configured join actions still run. Broadcast and game-end behavior,
+including strict trusted-plugin logger matching, is unchanged.
 
 In Vestri-managed mode, `joinTimeout` is the maximum roster-join wait after the server acknowledges its
 assignment. A no-show or joining/starting timeout cancels the match, returns
@@ -1125,11 +1183,14 @@ vestridynamic status
 
 Run `vestridynamic status` in the generated Paper server console to inspect its
 actual saved startup configuration and runtime state. It reports roster/frozen
-counts, setup/team/start command counts, and configured/verified end logger,
+counts, `setupCommands`, `teamCommands`, `startCommands`, `joinCommands`,
+`playerSenderCommands`, `serverSenderCommands`, and configured/verified end logger,
 without exposing the instance token. A managed instance with no startup commands
 finishes startup immediately after everyone joins and releases protection; it
 now warns about that configuration. Editing a template does not update the
-saved configuration of an existing instance. Startup and rejected-command logs
+saved configuration of an existing instance. These command counts describe
+configured entries, not expanded per-player invocations or successful gameplay
+executions. Startup and rejected-command logs
 are emitted on Paper where commands execute, not only on Velocity.
 
 These are local minigame-agent signals, not proxy lifecycle commands and not
@@ -1258,12 +1319,16 @@ JARs must also be updated so newly generated instances have the agent. Maintain
 the manually configured template keys so provisioning and cleanup remain usable.
 
 Deploy the updated frontend as well so newly generated template specs contain
-the intended `instanceMode`, lobby, and lifecycle settings; regenerate and verify
+the intended `instanceMode`, lobby, sender, and `onPlayerJoin` lifecycle settings;
+sender/join support requires updated backend, frontend, Velocity proxy, and Paper
+agents together. Regenerate and verify
 the spec before creating replacement instances. Resynchronize the proxy after
 deployment or template changes. A current instance uses its pinned spawn-time
 spec copy: changing a template or regenerating its spec cannot change that
 instance's mode in place. A temporary instance cannot become permanent by a
 template edit or a JAR update; recreate it with the intended spec.
+Existing instances also retain their pinned command senders and join lists:
+recreate an instance with the updated template spec to apply those changes.
 
 Templates and provisioning jobs retain saved configuration snapshots; changing
 the template does not rewrite an old job or automatically upgrade a current
