@@ -1120,7 +1120,17 @@ equivalents of `/vestridynamic ready` and `/vestridynamic end`):
 ```text
 vestridynamic ready
 vestridynamic end
+vestridynamic status
 ```
+
+Run `vestridynamic status` in the generated Paper server console to inspect its
+actual saved startup configuration and runtime state. It reports roster/frozen
+counts, setup/team/start command counts, and configured/verified end logger,
+without exposing the instance token. A managed instance with no startup commands
+finishes startup immediately after everyone joins and releases protection; it
+now warns about that configuration. Editing a template does not update the
+saved configuration of an existing instance. Startup and rejected-command logs
+are emitted on Paper where commands execute, not only on Velocity.
 
 These are local minigame-agent signals, not proxy lifecycle commands and not
 player commands. `ready` signals application readiness; `end` explicitly ends

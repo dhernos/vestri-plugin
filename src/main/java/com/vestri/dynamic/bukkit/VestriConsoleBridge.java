@@ -43,7 +43,7 @@ public final class VestriConsoleBridge extends JavaPlugin {
             return List.of();
         }
         if (arguments.length == 1 && minigameAgent != null) {
-            var suggestions = new java.util.ArrayList<>(List.of("ready", "end"));
+            var suggestions = new java.util.ArrayList<>(List.of("ready", "end", "status"));
             reloadConfig();
             suggestions.addAll(LifecycleSuggestions.complete(arguments, getConfig().getStringList("template-names"), false));
             return suggestions.stream().filter(value -> value.startsWith(arguments[0].toLowerCase(java.util.Locale.ROOT))).toList();
@@ -58,11 +58,14 @@ public final class VestriConsoleBridge extends JavaPlugin {
             audiences.sender(sender).sendMessage(PluginMessages.text("This command is console-only.", NamedTextColor.RED));
             return true;
         }
-        if (arguments.length > 0 && (arguments[0].equalsIgnoreCase("ready") || arguments[0].equalsIgnoreCase("end"))) {
+        if (arguments.length > 0 && (arguments[0].equalsIgnoreCase("ready") || arguments[0].equalsIgnoreCase("end")
+            || arguments[0].equalsIgnoreCase("status"))) {
             if (arguments.length != 1) {
                 sender.sendMessage("Usage: vestridynamic " + arguments[0]);
             } else if (minigameAgent == null) {
                 sender.sendMessage("No minigame agent is configured on this server.");
+            } else if (arguments[0].equalsIgnoreCase("status")) {
+                sender.sendMessage(minigameAgent.statusSummary());
             } else {
                 if (arguments[0].equalsIgnoreCase("ready")) {
                     minigameAgent.ready();

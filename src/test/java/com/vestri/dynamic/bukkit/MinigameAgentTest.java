@@ -33,6 +33,52 @@ class MinigameAgentTest {
     private final UUID match = UUID.fromString("12345678-1234-1234-1234-123456789abc");
 
         @Test
+        void listensToActualUnregisteredPluginLoggerWithoutParentHandlers() throws Exception {
+                var config = MinigameAgent.configuration(config("http://vestri-proxy-123:25580"));
+                Logger actual = new Logger("Game", null) { };
+                actual.setUseParentHandlers(false);
+                var installed = org.mockito.Mockito.mock(org.bukkit.plugin.Plugin.class);
+                org.mockito.Mockito.when(installed.getLogger()).thenReturn(actual);
+                try (var agent = new MinigameAgent(null, config, data.resolve("direct-logger.json"))) {
+                        agent.configureLogSource(new org.bukkit.plugin.Plugin[]{installed},
+                                        Logger.getLogger("Vestri"), Logger.getLogger("Minecraft"));
+                        agent.attachEndListener();
+                        assertEquals(1, actual.getHandlers().length);
+                        agent.ready();
+                        agent.apply(new MinigameAgent.Control("starting", match,
+                                        List.of(new MinigameAgent.Member(match, "First", "red"))), Set.of(match), command -> true);
+                        actual.info("finished");
+                        agent.apply(null, Set.of(match), command -> true);
+                        assertEquals("ended", status(agent));
+                }
+                assertEquals(0, actual.getHandlers().length);
+        }
+
+        @Test
+        void statusShowsSavedPhasesAndProtectionUntilFinalStartDispatch() throws Exception {
+                var config = MinigameAgent.configuration(phasedConfig());
+                var member = new MinigameAgent.Member(match, "First", "red");
+                try (var agent = new MinigameAgent(null, config, data.resolve("status.json"))) {
+                        agent.ready();
+                        assertTrue(agent.statusSummary().contains("state=ready"));
+                        agent.apply(new MinigameAgent.Control("joining", match, List.of(member)), Set.of(match),
+                                        command -> fail("Joining must not dispatch setup"));
+                        assertTrue(agent.frozen(match));
+                        assertTrue(agent.statusSummary().contains("frozen=1"));
+                        assertTrue(agent.statusSummary().contains("teamCommands=" + config.teamCommands().size()));
+                        assertTrue(agent.statusSummary().contains("startCommands=" + config.startCommands().size()));
+                        agent.apply(new MinigameAgent.Control("starting", match, List.of(member)), Set.of(match), command -> {
+                                assertTrue(agent.frozen(match));
+                                return true;
+                        });
+                        assertFalse(agent.frozen(match));
+                        assertTrue(agent.statusSummary().contains("state=running"));
+                        assertTrue(agent.statusSummary().contains("frozen=0"));
+                        assertFalse(agent.statusSummary().contains(config.token()));
+                }
+        }
+
+        @Test
         void onlyVerifiedExactPluginLoggerCanEndAndRawAnchorsHaveNoPrefix() throws Exception {
                 String text = config("http://vestri-proxy-123:25580").replace("finished", "^xy$");
                 var config = MinigameAgent.configuration(text);
@@ -928,8 +974,9 @@ class MinigameAgentTest {
                         assertEquals("running", status(agent));
                         assertTrue(agent.allows(match));
                         assertEquals(saved, Files.readString(path));
-                        assertEquals(4, logs.size());
-                        for (var log : logs) {
+                        var endLogs = logs.stream().filter(log -> log.getMessage().contains("end ignored")).toList();
+                        assertEquals(4, endLogs.size());
+                        for (var log : endLogs) {
                                 assertEquals(java.util.logging.Level.INFO, log.getLevel());
                                 assertTrue(log.getMessage().contains("end ignored"));
                                 assertFalse(log.getMessage().contains(config.token()));

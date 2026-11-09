@@ -81,6 +81,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
     private BukkitTask mainTask;
     private BukkitTask readyTask;
     private Handler logHandler;
+    private Logger endLogger;
     private volatile String trustedEndLogger;
     private PreStartGuard preStartGuard;
 
@@ -147,19 +148,12 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         if (config.endPattern() != null) {
             configureLogSource(plugin.getServer().getPluginManager().getPlugins(),
                     plugin.getLogger(), plugin.getServer().getLogger());
-            logHandler = new Handler() {
-                @Override
-                public void publish(LogRecord record) {
-                    observeLog(record);
-                }
-
-                @Override
-                public void flush() { }
-
-                @Override
-                public void close() { }
-            };
-            Logger.getLogger("").addHandler(logHandler);
+            attachEndListener();
+        }
+        diagnostics.logger.info(statusSummary());
+        if (config.lobbyMode().equals("vestri") && config.actions().isEmpty()
+                && config.teamCommands().isEmpty() && config.startCommands().isEmpty()) {
+            diagnostics.logger.warning("Managed minigame has no setup, team or start commands in this instance's saved configuration; startup will finish immediately once all players join. Template edits do not update existing instances.");
         }
         pollTask = polling.scheduleAtFixedRate(this::poll, 0, 1, TimeUnit.SECONDS);
     }
@@ -186,8 +180,20 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         return !closed && config.lobbyMode().equals("vestri") && !state.equals("running") && allowed.contains(player);
     }
 
+    public String statusSummary() {
+        long frozenPlayers = roster.stream().filter(member -> frozen(member.uuid())).count();
+        return "Minigame status: state=" + state + ", ready=" + readySignalled
+                + ", lobbyMode=" + config.lobbyMode() + ", matchId=" + fence.matchId()
+                + ", roster=" + roster.size() + ", frozen=" + frozenPlayers
+                + ", setupCommands=" + config.actions().size() + ", teamCommands=" + config.teamCommands().size()
+                + ", startCommands=" + config.startCommands().size()
+                + ", endPattern=" + (config.endPattern() == null ? "absent" : "configured")
+                + ", configuredLogger=" + config.loggerName() + ", trustedLogger=" + trustedEndLogger;
+    }
+
     void configureLogSource(org.bukkit.plugin.Plugin[] installed, Logger own, Logger server) {
         trustedEndLogger = null;
+        endLogger = null;
         String name = config.loggerName();
         if (name != null && !name.equals(own.getName()) && !name.equals(server.getName())
                 && !Set.of("", "global", "minecraft", "bukkit", "server", "vestri", "vestridynamicservers")
@@ -196,6 +202,7 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 if (candidate.getLogger() != own && candidate.getLogger() != server
                         && name.equals(candidate.getLogger().getName())) {
                     trustedEndLogger = name;
+                    endLogger = candidate.getLogger();
                     break;
                 }
             }
@@ -203,6 +210,25 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         if (config.endPattern() != null && trustedEndLogger == null) {
             diagnostics.logger.warning("Minigame automatic log end disabled: lifecycle.end.loggerName must exactly match an installed game plugin logger (not Vestri or the server). Explicit and empty-server end remain available.");
         }
+    }
+
+    void attachEndListener() {
+        if (endLogger == null || logHandler != null) {
+            return;
+        }
+        logHandler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                observeLog(record);
+            }
+
+            @Override
+            public void flush() { }
+
+            @Override
+            public void close() { }
+        };
+        endLogger.addHandler(logHandler);
     }
 
     /**
@@ -214,7 +240,10 @@ public final class MinigameAgent implements Listener, AutoCloseable {
         if (trustedEndLogger != null && record != null && trustedEndLogger.equals(record.getLoggerName())
                 && !config.permanent() && !closed && state.equals("running") && config.endPattern() != null && message != null
                 && message.length() <= 4096 && config.endPattern().matcher(message).find()) {
-            endRequested.set(true);
+            if (endRequested.compareAndSet(false, true)) {
+                diagnostics.logger.info("Minigame end pattern matched trusted plugin logger=" + trustedEndLogger
+                        + ", matchId=" + fence.matchId());
+            }
         }
     }
 
@@ -284,8 +313,12 @@ public final class MinigameAgent implements Listener, AutoCloseable {
                 return;
             }
             if (fence.roster() != null) {
+                boolean firstAssignment = allowed.isEmpty() && !fence.roster().isEmpty();
                 roster = fence.roster();
                 allowed = Set.copyOf(roster.stream().map(Member::uuid).toList());
+                if (firstAssignment) {
+                    diagnostics.logger.info("Minigame roster applied on Paper: " + statusSummary());
+                }
             }
             if (response.state().equals("ending")) {
                 end();
@@ -304,9 +337,21 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             }
             state = "starting";
             List<String> commands = expand(config, roster, response.matchId());
-            boolean success = dispatch(commands, command -> !terminal() && execute.test(command));
+            diagnostics.logger.info("Minigame startup on Paper console: matchId=" + response.matchId()
+                    + ", players=" + roster.size() + ", expandedCommands=" + commands.size());
+            int[] commandIndex = {0};
+            boolean success = dispatch(commands, command -> {
+                commandIndex[0]++;
+                boolean accepted = !terminal() && execute.test(command);
+                if (!accepted) {
+                    diagnostics.logger.warning("Minigame Paper console command rejected at index=" + commandIndex[0]
+                            + "; remaining startup commands aborted and players remain protected.");
+                }
+                return accepted;
+            });
             if (!terminal()) {
                 state = success ? "running" : "failed";
+                diagnostics.logger.info("Minigame startup completed on Paper: " + statusSummary());
             }
         } catch (RuntimeException failure) {
             state = "failed";
@@ -438,7 +483,9 @@ public final class MinigameAgent implements Listener, AutoCloseable {
             HandlerList.unregisterAll(preStartGuard);
         }
         if (logHandler != null) {
-            Logger.getLogger("").removeHandler(logHandler);
+            if (endLogger != null) {
+                endLogger.removeHandler(logHandler);
+            }
             logHandler.close();
         }
         incoming.set(null);
